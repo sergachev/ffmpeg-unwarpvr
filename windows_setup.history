@@ -1,0 +1,203 @@
+    1  ls
+    2  ls ~
+    3  exit
+    4  exit
+    5  git
+    6  yasm
+    7  ls bin
+    8  ls /bin
+    9  yasm.exe
+   10  exit
+   11  yasm
+   12  yasm
+   13  set | grep MINGW_PATH 
+   14  set | grep -i path
+   15  cd ~
+   16  pwd
+   17  ls
+   18  tar -jxf last_x264.tar.bz2 
+   19  ls
+   20  cd last_x264.tar.bz2 
+   21  ls
+   22  cd x264-snapshot-20140924-2245/
+   23  ls
+   24  ./configure
+   25  gcc
+   26  path
+   27  set | grep -i path
+   28  /bin/gcc
+   29  g++
+   30  exit
+   31  gcc
+   32  ls
+   33  cd /bin
+   34  ls *gcc*
+   35  cd /usr/local
+   36  cd /usr
+   37  ls
+   38  exit
+   39  pkg-config.exe 
+   40  pkg-config
+   41  pkg-config
+   42  pkg-config
+   43  pkg-config
+   44  ls
+   45  ls
+   46  git clone git@github.com:eVRydayVR/ffmpeg-vr-unwarp.git
+   47  git clone git@github.com:eVRydayVR/ffmpeg-vr-unwarp.git
+   48  cd ffmpeg-vr-unwarp/
+   49  ls
+   50  ./configure --enable-gpl --enable-libx264
+   51  ./configure --enable-gpl --enable-libx264
+   52  ls /lib/lib*
+   53  ls /lib/libx*
+   54  ./configure
+   55  cd ..
+   56  ls
+   57  cd x264-snapshot-20140924-2245/
+   58  make install
+   59  cd ..
+   60  ls
+   61  cd ffmpeg-vr-unwarp/
+   62  ./configure --enable-gpl --enable-libx264
+   63  pkg-config
+   64  pkg-config --list-all
+   65  tail config.log
+   66  ls
+   67  cd ~
+   68  ls
+   69  cd x264-snapshot-20140924-2245/
+   70  ls
+   71  emacs Makefile 
+   72  notepad Makefile 
+   73  make install-lib-dev
+   74  cd ..
+   75  cd ffmpeg-vr-unwarp/
+   76  cd ~/x264-snapshot-20140924-2245/
+   77  ls
+   78  make install
+   79  cd ~
+   80  ls
+   81  cd ffmpeg-vr-unwarp/
+   82  ls
+   83  ./configure --enable-gpl --enable-libx264 --extra-cflags=-I/usr/local/include --extra-ldflags=-L/usr/local/lib
+   84  make
+   85  dir
+   86  ./ffmpeg
+   87  cd test
+   88  ls
+   89  cd tests
+   90  cd unwarpvr/
+   91  ls
+   92  ./test.sh
+   93  cd ..
+   94  cd ..
+   95  ./ffmpeg -codecs | grep png
+   96  notepad configure_windows.sh
+   97  chmod u+x configure_windows.sh 
+   98  ./configure windows.sh
+   99  ./configure_windows.sh
+  100  make
+  101  cd ..
+  102  wget http://zlib.net/zlib-1.2.8.tar.gz
+  103  tar -zxf zlib-1.2.8.tar.gz 
+  104  ls
+  105  cd zlib-1.2.8
+  106  ls
+  107  ./configure
+  108  cd win32
+  109  ls
+  110  notepad README-WIN32.txt 
+  111  cd ..
+  112  ls
+  113  make
+  114  cd win32
+  115  ls
+  116  make
+  117  cd ..
+  118  make -f win32/Makefile.gcc
+  119  make install
+  120  make -f win32/Makefile.gcc install
+  121  ls
+  122  echo $HOST
+  123  set | grep HOST
+  124  set | grep PREFIX
+  125  ls /include
+  126  ls /usr/local/include
+  127  make -f win32/Makefile.gcc install BINARY_PATH=/usr/local/bin INCLUDE_PATH=/usr/local/include LIBRARY_PATH=/usr/local/lib
+  128  cd ..
+  129  ls
+  130  cd ffmpeg-vr-unwarp/
+  131  ./configure_windows.sh
+  132  make
+  133  make clean
+  134  make -j8
+  135  make clean
+  136  make
+  137  cd tests
+  138  ls
+  139  cd unwarpvr/
+  140  ls
+  141  ./test.sh
+  142  cd ..
+  143  cd ..
+  144  cp ffmpeg.exe c:\temp
+  145  ls
+  146  find -name libx*
+  147  pushd ..
+  148  find -name libx2*
+  149  cd x264-snapshot-20140924-2245/
+  150  cp libx264-142.dll c:\temp
+  151  cd ..
+  152  cd /
+  153  find -name libgcc*.dll
+  154  find -name libgcc*
+  155  find -name libg*
+  156  find -name *.dll
+  157  cd ~
+  158  ls
+  159  cd ffmpeg-vr-unwarp/
+  160  ls
+  161  notepad configure_windows.sh 
+  162  ./configure_windows.sh
+  163  cd ..
+  164  ls
+  165  cd x264-snapshot-20140924-2245/
+  166  ls
+  167  ./configure
+  168  make
+  169  make clean
+  170  make
+  171  make install
+  172  cd ..
+  173  ls
+  174  cd ffmpeg-vr-unwarp/
+  175  ./configure_windows.sh
+  176  tail config.log
+  177  ./configure_windows.sh
+  178  make
+  179  explorer .
+  180  cd tests
+  181  ls
+  182  cd ..
+  183  git add configure_windows.sh
+  184  cd tests
+  185  cd unwarpvr/
+  186  ls
+  187  emacs test.sh
+  188  notepad test.sh
+  189  ./test.sh
+  190  notepad test.sh
+  191  ./test.sh
+  192  explorer .
+  193  git status
+  194  git add -u
+  195  cd ..
+  196  cd ..
+  197  git commit -m "Get building in Windows, modify tests to create video with yuv420p, which allows them to be loaded directly in Premiere Pro"
+  198  git config --global user.email "eVRydayVR@gmail.com"
+  199  git config --global user.name eVRydayVR
+  200  git commit -m "Get building in Windows, modify tests to create video with yuv420p, which allows them to be loaded directly in Premiere Pro"
+  201  git push
+  202  history
+  203  history > windows_setup.history
