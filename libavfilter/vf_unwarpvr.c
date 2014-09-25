@@ -197,28 +197,6 @@ static int query_formats(AVFilterContext *ctx)
     return 0;
 }
 
-static const int *parse_yuv_type(const char *s, enum AVColorSpace colorspace)
-{
-    if (!s)
-        s = "bt601";
-
-    if (s && strstr(s, "bt709")) {
-        colorspace = AVCOL_SPC_BT709;
-    } else if (s && strstr(s, "fcc")) {
-        colorspace = AVCOL_SPC_FCC;
-    } else if (s && strstr(s, "smpte240m")) {
-        colorspace = AVCOL_SPC_SMPTE240M;
-    } else if (s && (strstr(s, "bt601") || strstr(s, "bt470") || strstr(s, "smpte170m"))) {
-        colorspace = AVCOL_SPC_BT470BG;
-    }
-
-    if (colorspace < 1 || colorspace > 7) {
-        colorspace = AVCOL_SPC_BT470BG;
-    }
-
-    return sws_getCoefficients(colorspace);
-}
-
 static int config_props(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
@@ -394,30 +372,6 @@ fail:
     return ret;
 }
 
-static int scale_slice(AVFilterLink *link, AVFrame *out_buf, AVFrame *cur_pic, struct SwsContext *sws, int y, int h, int mul, int field)
-{
-    UnwarpVRContext *scale = link->dst->priv;
-    const uint8_t *in[4];
-    uint8_t *out[4];
-    int in_stride[4],out_stride[4];
-    int i;
-
-    for(i=0; i<4; i++){
-        int vsub= ((i+1)&2) ? scale->vsub : 0;
-         in_stride[i] = cur_pic->linesize[i] * mul;
-        out_stride[i] = out_buf->linesize[i] * mul;
-         in[i] = cur_pic->data[i] + ((y>>vsub)+field) * cur_pic->linesize[i];
-        out[i] = out_buf->data[i] +            field  * out_buf->linesize[i];
-    }
-    if(scale->input_is_pal)
-         in[1] = cur_pic->data[1];
-    if(scale->output_is_pal)
-        out[1] = out_buf->data[1];
-
-    return sws_scale(sws, in, in_stride, y/mul, h,
-                         out,out_stride);
-}
-
 const int NumSegments = 11;
 
 // From OVR_Stereo.cpp, evaluates Catmull-Rom spline based on provided K values
@@ -495,13 +449,8 @@ float EvalCatmullRom10SplineInv ( float const *K, float const CA0, float const C
 
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
-    UnwarpVRContext *scale = link->dst->priv;
     AVFilterLink *outlink = link->dst->outputs[0];
     AVFrame *out;
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
-    char buf[32];
-    int in_range;
-
     const uint8_t *src = in->data[0];
 
     uint8_t *dstrow;
@@ -604,96 +553,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
             dstrow += out->linesize[0];
         }
-    }
-
-    av_frame_free(&in);
-    return ff_filter_frame(outlink, out);
-
-    if(   in->width  != link->w
-       || in->height != link->h
-       || in->format != link->format) {
-        int ret;
-        snprintf(buf, sizeof(buf)-1, "%d", outlink->w);
-        av_opt_set(scale, "w", buf, 0);
-        snprintf(buf, sizeof(buf)-1, "%d", outlink->h);
-        av_opt_set(scale, "h", buf, 0);
-
-        link->dst->inputs[0]->format = in->format;
-        link->dst->inputs[0]->w      = in->width;
-        link->dst->inputs[0]->h      = in->height;
-
-        if ((ret = config_props(outlink)) < 0)
-            return ret;
-    }
-
-    if (!scale->sws)
-        return ff_filter_frame(outlink, in);
-
-    scale->hsub = desc->log2_chroma_w;
-    scale->vsub = desc->log2_chroma_h;
-
-    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-    if (!out) {
-        av_frame_free(&in);
-        return AVERROR(ENOMEM);
-    }
-
-    av_frame_copy_props(out, in);
-    out->width  = outlink->w;
-    out->height = outlink->h;
-
-    if(scale->output_is_pal)
-        avpriv_set_systematic_pal2((uint32_t*)out->data[1], outlink->format == AV_PIX_FMT_PAL8 ? AV_PIX_FMT_BGR8 : outlink->format);
-
-    in_range = av_frame_get_color_range(in);
-
-    if (   scale->in_color_matrix
-        || scale->out_color_matrix
-        || scale-> in_range != AVCOL_RANGE_UNSPECIFIED
-        || in_range != AVCOL_RANGE_UNSPECIFIED
-        || scale->out_range != AVCOL_RANGE_UNSPECIFIED) {
-        int in_full, out_full, brightness, contrast, saturation;
-        const int *inv_table, *table;
-
-        sws_getColorspaceDetails(scale->sws, (int **)&inv_table, &in_full,
-                                 (int **)&table, &out_full,
-                                 &brightness, &contrast, &saturation);
-
-        if (scale->in_color_matrix)
-            inv_table = parse_yuv_type(scale->in_color_matrix, av_frame_get_colorspace(in));
-        if (scale->out_color_matrix)
-            table     = parse_yuv_type(scale->out_color_matrix, AVCOL_SPC_UNSPECIFIED);
-
-        if (scale-> in_range != AVCOL_RANGE_UNSPECIFIED)
-            in_full  = (scale-> in_range == AVCOL_RANGE_JPEG);
-        else if (in_range != AVCOL_RANGE_UNSPECIFIED)
-            in_full  = (in_range == AVCOL_RANGE_JPEG);
-        if (scale->out_range != AVCOL_RANGE_UNSPECIFIED)
-            out_full = (scale->out_range == AVCOL_RANGE_JPEG);
-
-        sws_setColorspaceDetails(scale->sws, inv_table, in_full,
-                                 table, out_full,
-                                 brightness, contrast, saturation);
-        if (scale->isws[0])
-            sws_setColorspaceDetails(scale->isws[0], inv_table, in_full,
-                                     table, out_full,
-                                     brightness, contrast, saturation);
-        if (scale->isws[1])
-            sws_setColorspaceDetails(scale->isws[1], inv_table, in_full,
-                                     table, out_full,
-                                     brightness, contrast, saturation);
-    }
-
-    av_reduce(&out->sample_aspect_ratio.num, &out->sample_aspect_ratio.den,
-              (int64_t)in->sample_aspect_ratio.num * outlink->h * link->w,
-              (int64_t)in->sample_aspect_ratio.den * outlink->w * link->h,
-              INT_MAX);
-
-    if(scale->interlaced>0 || (scale->interlaced<0 && in->interlaced_frame)){
-        scale_slice(link, out, in, scale->isws[0], 0, (link->h+1)/2, 2, 0);
-        scale_slice(link, out, in, scale->isws[1], 0,  link->h   /2, 2, 1);
-    }else{
-        scale_slice(link, out, in, scale->sws, 0, link->h, 1, 0);
     }
 
     av_frame_free(&in);
