@@ -499,11 +499,19 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
     uint8_t *dstrow;
     int i, j, channel, eye;
+    // Distortion varies by SDK version but never by cup type or eye relief (in 0.4.2)
     const float K[] = {1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f};
-    // const float ChromaticAberration[] = {-0.0112f, -0.015f, 0.0187f, 0.015f};
-    const float ChromaticAberration[] = {-0.0131f, -0.0175f, 0.02185f, 0.0175};
+    // ChromaticAbberation varies by eye relief and lerps between the following two arrays
+    const float ChromaticAberrationMin[] = {-0.0112f, -0.015f, 0.0187f, 0.015f};
+    const float ChromaticAberrationMax[] = {-0.015f, -0.02f, 0.025f, 0.02f};
+    int dial = 5; // 10 for max, 0 for min
+    float ChromaticAberration[4];
     static float* inv_cache = NULL;
     float *inv_cache_p;
+
+    for (i=0; i < sizeof(ChromaticAberration)/sizeof(*ChromaticAberration); i++) {
+        ChromaticAberration[i] = ChromaticAberrationMin[i] + dial/10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
+    }
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
