@@ -46,6 +46,14 @@
 #include "libavutil/avassert.h"
 #include "libswscale/swscale.h"
 
+#ifdef _WIN32
+#include <windows.h>
+const char *unexpanded_profile_path = "%USERPROFILE%\\AppData\\Local\\Oculus\\ProfileDB.json";
+#else
+const char *profile_path = "ProfileDB.json";
+hfdsjknfkjsdn // TODO! Profile path on Linux
+#endif
+
 static const char *const var_names[] = {
     "in_w",   "iw",
     "in_h",   "ih",
@@ -114,72 +122,189 @@ typedef struct UnwarpVRContext {
     int in_v_chr_pos;
 
     int force_original_aspect_ratio;
+
+    int eye_relief_dial;
 } UnwarpVRContext;
+
+static av_cold int ovr_parse_error(AVFilterContext *ctx, json_t *root, const char *reason)
+{
+    av_log(ctx, AV_LOG_ERROR,
+        "Error encountered parsing Oculus SDK profile (%s).\n", reason);
+    json_decref(root);
+    return AVERROR(EINVAL);
+}
 
 static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
 {
-    UnwarpVRContext *scale = ctx->priv;
-    int ret;
+    UnwarpVRContext *unwarpvr = ctx->priv;
+    int i, j, ret;
+    int found_user_profile = 0;
+    json_t *root, *json, *tagged_data;
+    json_error_t error;
+    const char* default_user = NULL;
+    const char* selected_product = "RiftDK2";
 
-    if (scale->size_str && (scale->w_expr || scale->h_expr)) {
+#ifdef _WIN32
+    char profile_path[FILENAME_MAX + 1];
+    ExpandEnvironmentStrings(unexpanded_profile_path, profile_path, sizeof(profile_path) / sizeof(*profile_path));
+#else
+    hfdsjknfkjsdn // TODO!
+#endif
+
+    // Default settings if not specified in JSON
+    unwarpvr->eye_relief_dial = 3;
+
+    root = json_load_file(profile_path, 0, &error);
+    if (!root) {
+        av_log(ctx, AV_LOG_ERROR,
+            "Could not find Oculus SDK profile. Oculus Runtime may not be installed.\n");
+        return AVERROR(EINVAL);
+    }
+    if (!json_is_object(root))
+        return ovr_parse_error(ctx, root, "root is not object");
+    tagged_data = json_object_get(root, "TaggedData");
+    if (!json_is_array(tagged_data))
+        return ovr_parse_error(ctx, root, "TaggedData is not array");
+    for (i = 0; i < json_array_size(tagged_data); i++)
+    {
+        json_t *tags, *vals;
+        json = json_array_get(tagged_data, i);
+        if (!json_is_object(json))
+            return ovr_parse_error(ctx, root, "TaggedData element is not object");
+        tags = json_object_get(json, "tags");
+        vals = json_object_get(json, "vals");
+        if (!json_is_array(tags))
+            return ovr_parse_error(ctx, root, "tags is not array");
+        if (!json_is_object(vals))
+            return ovr_parse_error(ctx, root, "vals is not object");
+        for (j = 0; j < json_array_size(tags); j++)
+        {
+            json_t *product;
+            json = json_array_get(tags, j);
+            if (!json_is_object(json))
+                return ovr_parse_error(ctx, root, "tags element is not object");
+            product = json_object_get(json, "Product");
+            if (json_is_string(product) && strcmp(json_string_value(product), selected_product) == 0)
+            {
+                json_t *default_user_json = json_object_get(vals, "DefaultUser");
+                if (json_is_string(default_user_json))
+                {
+                    const char* default_user_here = json_string_value(default_user_json);
+                    if (default_user == NULL)
+                    {
+                        default_user = default_user_here;
+                    }
+                    else if (strcmp(default_user, default_user_here) != 0)
+                    {
+                        return ovr_parse_error(ctx, root, "two matching devices with different default users");
+                    }
+                }
+            }
+        }
+    }
+    if (default_user == NULL)
+        return ovr_parse_error(ctx, root, "could not find default user for selected device");
+    av_log(ctx, AV_LOG_INFO, "Reading profile settings from Oculus SDK user '%s'\n", default_user);
+
+    found_user_profile = 0;
+    for (i = 0; i < json_array_size(tagged_data); i++)
+    {
+        json_t *tags, *vals;
+        int matched_user = 0, matched_product = 0;
+
+        json = json_array_get(tagged_data, i);
+        if (!json_is_object(json))
+            return ovr_parse_error(ctx, root, "TaggedData element is not object");
+        tags = json_object_get(json, "tags");
+        vals = json_object_get(json, "vals");
+        if (!json_is_array(tags))
+            return ovr_parse_error(ctx, root, "tags is not array");
+        if (!json_is_object(vals))
+            return ovr_parse_error(ctx, root, "vals is not object");
+        for (j = 0; j < json_array_size(tags); j++)
+        {
+            json_t *product, *user;
+            json = json_array_get(tags, j);
+            if (!json_is_object(json))
+                return ovr_parse_error(ctx, root, "tags element is not object");
+            user = json_object_get(json, "User");
+            if (json_is_string(user) && strcmp(json_string_value(user), default_user) == 0)
+                matched_user = 1;
+            product = json_object_get(json, "Product");
+            if (json_is_string(product) && strcmp(json_string_value(product), selected_product) == 0)
+                matched_product = 1;
+        }
+        if (matched_user && matched_product)
+        {
+            json_t *eye_relief_dial = json_object_get(vals, "EyeReliefDial");
+            if (json_is_integer(eye_relief_dial))
+            {
+                unwarpvr->eye_relief_dial = json_integer_value(eye_relief_dial);
+            }
+            else if (eye_relief_dial != NULL)
+                return ovr_parse_error(ctx, root, "EyeReliefDial is not integer");
+            av_log(ctx, AV_LOG_VERBOSE, "Oculus profile settings: eye_relief_dial:%d\n",
+                   unwarpvr->eye_relief_dial);
+            found_user_profile = 1;
+        }
+    }
+    if (!found_user_profile)
+        return ovr_parse_error(ctx, root, "could not find user profile for default user for selected device");
+    json_decref(root);
+
+    if (unwarpvr->size_str && (unwarpvr->w_expr || unwarpvr->h_expr)) {
         av_log(ctx, AV_LOG_ERROR,
                "Size and width/height expressions cannot be set at the same time.\n");
-            return AVERROR(EINVAL);
+        return AVERROR(EINVAL);
     }
 
-    if (scale->w_expr && !scale->h_expr)
-        FFSWAP(char *, scale->w_expr, scale->size_str);
+    if (unwarpvr->w_expr && !unwarpvr->h_expr)
+        FFSWAP(char *, unwarpvr->w_expr, unwarpvr->size_str);
 
-    if (scale->size_str) {
+    if (unwarpvr->size_str) {
         char buf[32];
-        if ((ret = av_parse_video_size(&scale->w, &scale->h, scale->size_str)) < 0) {
+        if ((ret = av_parse_video_size(&unwarpvr->w, &unwarpvr->h, unwarpvr->size_str)) < 0) {
             av_log(ctx, AV_LOG_ERROR,
-                   "Invalid size '%s'\n", scale->size_str);
+                  "Invalid size '%s'\n", unwarpvr->size_str);
             return ret;
         }
-        snprintf(buf, sizeof(buf)-1, "%d", scale->w);
-        av_opt_set(scale, "w", buf, 0);
-        snprintf(buf, sizeof(buf)-1, "%d", scale->h);
-        av_opt_set(scale, "h", buf, 0);
+        snprintf(buf, sizeof(buf)-1, "%d", unwarpvr->w);
+        av_opt_set(unwarpvr, "w", buf, 0);
+        snprintf(buf, sizeof(buf)-1, "%d", unwarpvr->h);
+        av_opt_set(unwarpvr, "h", buf, 0);
     }
-    if (!scale->w_expr)
-        av_opt_set(scale, "w", "iw", 0);
-    if (!scale->h_expr)
-        av_opt_set(scale, "h", "ih", 0);
+    if (!unwarpvr->w_expr)
+        av_opt_set(unwarpvr, "w", "iw", 0);
+    if (!unwarpvr->h_expr)
+        av_opt_set(unwarpvr, "h", "ih", 0);
 
     av_log(ctx, AV_LOG_VERBOSE, "w:%s h:%s flags:'%s' interl:%d\n",
-           scale->w_expr, scale->h_expr, (char *)av_x_if_null(scale->flags_str, ""), scale->interlaced);
+           unwarpvr->w_expr, unwarpvr->h_expr, (char *)av_x_if_null(unwarpvr->flags_str, ""), unwarpvr->interlaced);
 
-    scale->flags = 0;
+    unwarpvr->flags = 0;
 
-    if (scale->flags_str) {
+    if (unwarpvr->flags_str) {
         const AVClass *class = sws_get_class();
         const AVOption    *o = av_opt_find(&class, "sws_flags", NULL, 0,
                                            AV_OPT_SEARCH_FAKE_OBJ);
-        int ret = av_opt_eval_flags(&class, o, scale->flags_str, &scale->flags);
+        int ret = av_opt_eval_flags(&class, o, unwarpvr->flags_str, &unwarpvr->flags);
         if (ret < 0)
             return ret;
     }
-    scale->opts = *opts;
+    unwarpvr->opts = *opts;
     *opts = NULL;
-
-    {
-    json_t *root;
-    json_error_t error;
-    json_loads("{\"glossary\": {\"title\": \"example glossary\"}}", 0, &error);
-    }
 
     return 0;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
-    UnwarpVRContext *scale = ctx->priv;
-    sws_freeContext(scale->sws);
-    sws_freeContext(scale->isws[0]);
-    sws_freeContext(scale->isws[1]);
-    scale->sws = NULL;
-    av_dict_free(&scale->opts);
+    UnwarpVRContext *unwarpvr = ctx->priv;
+    sws_freeContext(unwarpvr->sws);
+    sws_freeContext(unwarpvr->isws[0]);
+    sws_freeContext(unwarpvr->isws[1]);
+    unwarpvr->sws = NULL;
+    av_dict_free(&unwarpvr->opts);
 }
 
 static int query_formats(AVFilterContext *ctx)
@@ -202,7 +327,7 @@ static int config_props(AVFilterLink *outlink)
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink = outlink->src->inputs[0];
     enum AVPixelFormat outfmt = outlink->format;
-    UnwarpVRContext *scale = ctx->priv;
+    UnwarpVRContext *unwarpvr = ctx->priv;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     const AVPixFmtDescriptor *out_desc = av_pix_fmt_desc_get(outlink->format);
     int64_t w, h;
@@ -225,24 +350,24 @@ static int config_props(AVFilterLink *outlink)
     var_values[VAR_OVSUB] = 1 << out_desc->log2_chroma_h;
 
     /* evaluate width and height */
-    av_expr_parse_and_eval(&res, (expr = scale->w_expr),
+    av_expr_parse_and_eval(&res, (expr = unwarpvr->w_expr),
                            var_names, var_values,
                            NULL, NULL, NULL, NULL, NULL, 0, ctx);
-    scale->w = var_values[VAR_OUT_W] = var_values[VAR_OW] = res;
-    if ((ret = av_expr_parse_and_eval(&res, (expr = scale->h_expr),
+    unwarpvr->w = var_values[VAR_OUT_W] = var_values[VAR_OW] = res;
+    if ((ret = av_expr_parse_and_eval(&res, (expr = unwarpvr->h_expr),
                                       var_names, var_values,
                                       NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0)
         goto fail;
-    scale->h = var_values[VAR_OUT_H] = var_values[VAR_OH] = res;
+    unwarpvr->h = var_values[VAR_OUT_H] = var_values[VAR_OH] = res;
     /* evaluate again the width, as it may depend on the output height */
-    if ((ret = av_expr_parse_and_eval(&res, (expr = scale->w_expr),
+    if ((ret = av_expr_parse_and_eval(&res, (expr = unwarpvr->w_expr),
                                       var_names, var_values,
                                       NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0)
         goto fail;
-    scale->w = res;
+    unwarpvr->w = res;
 
-    w = scale->w;
-    h = scale->h;
+    w = unwarpvr->w;
+    h = unwarpvr->h;
 
     /* Check if it is requested that the result has to be divisible by a some
      * factor (w or h = -n with n being the factor). */
@@ -256,11 +381,11 @@ static int config_props(AVFilterLink *outlink)
     }
 
     if (w < 0 && h < 0)
-        scale->w = scale->h = 0;
+        unwarpvr->w = unwarpvr->h = 0;
 
-    if (!(w = scale->w))
+    if (!(w = unwarpvr->w))
         w = inlink->w;
-    if (!(h = scale->h))
+    if (!(h = unwarpvr->h))
         h = inlink->h;
 
     /* Make sure that the result is divisible by the factor we determined
@@ -273,11 +398,11 @@ static int config_props(AVFilterLink *outlink)
 
     /* Note that force_original_aspect_ratio may overwrite the previous set
      * dimensions so that it is not divisible by the set factors anymore. */
-    if (scale->force_original_aspect_ratio) {
+    if (unwarpvr->force_original_aspect_ratio) {
         int tmp_w = av_rescale(h, inlink->w, inlink->h);
         int tmp_h = av_rescale(w, inlink->h, inlink->w);
 
-        if (scale->force_original_aspect_ratio == 1) {
+        if (unwarpvr->force_original_aspect_ratio == 1) {
              w = FFMIN(tmp_w, w);
              h = FFMIN(tmp_h, h);
         } else {
@@ -296,24 +421,24 @@ static int config_props(AVFilterLink *outlink)
 
     /* TODO: make algorithm configurable */
 
-    scale->input_is_pal = desc->flags & AV_PIX_FMT_FLAG_PAL ||
-                          desc->flags & AV_PIX_FMT_FLAG_PSEUDOPAL;
+    unwarpvr->input_is_pal = desc->flags & AV_PIX_FMT_FLAG_PAL ||
+                             desc->flags & AV_PIX_FMT_FLAG_PSEUDOPAL;
     if (outfmt == AV_PIX_FMT_PAL8) outfmt = AV_PIX_FMT_BGR8;
-    scale->output_is_pal = av_pix_fmt_desc_get(outfmt)->flags & AV_PIX_FMT_FLAG_PAL ||
-                           av_pix_fmt_desc_get(outfmt)->flags & AV_PIX_FMT_FLAG_PSEUDOPAL;
+    unwarpvr->output_is_pal = av_pix_fmt_desc_get(outfmt)->flags & AV_PIX_FMT_FLAG_PAL ||
+                              av_pix_fmt_desc_get(outfmt)->flags & AV_PIX_FMT_FLAG_PSEUDOPAL;
 
-    if (scale->sws)
-        sws_freeContext(scale->sws);
-    if (scale->isws[0])
-        sws_freeContext(scale->isws[0]);
-    if (scale->isws[1])
-        sws_freeContext(scale->isws[1]);
-    scale->isws[0] = scale->isws[1] = scale->sws = NULL;
+    if (unwarpvr->sws)
+        sws_freeContext(unwarpvr->sws);
+    if (unwarpvr->isws[0])
+        sws_freeContext(unwarpvr->isws[0]);
+    if (unwarpvr->isws[1])
+        sws_freeContext(unwarpvr->isws[1]);
+    unwarpvr->isws[0] = unwarpvr->isws[1] = unwarpvr->sws = NULL;
     if (inlink->w == outlink->w && inlink->h == outlink->h &&
         inlink->format == outlink->format)
         ;
     else {
-        struct SwsContext **swscs[3] = {&scale->sws, &scale->isws[0], &scale->isws[1]};
+        struct SwsContext **swscs[3] = { &unwarpvr->sws, &unwarpvr->isws[0], &unwarpvr->isws[1] };
         int i;
 
         for (i = 0; i < 3; i++) {
@@ -322,10 +447,10 @@ static int config_props(AVFilterLink *outlink)
             if (!*s)
                 return AVERROR(ENOMEM);
 
-            if (scale->opts) {
+            if (unwarpvr->opts) {
                 AVDictionaryEntry *e = NULL;
 
-                while ((e = av_dict_get(scale->opts, "", e, AV_DICT_IGNORE_SUFFIX))) {
+                while ((e = av_dict_get(unwarpvr->opts, "", e, AV_DICT_IGNORE_SUFFIX))) {
                     if ((ret = av_opt_set(*s, e->key, e->value, 0)) < 0)
                         return ret;
                 }
@@ -337,16 +462,16 @@ static int config_props(AVFilterLink *outlink)
             av_opt_set_int(*s, "dstw", outlink->w, 0);
             av_opt_set_int(*s, "dsth", outlink->h >> !!i, 0);
             av_opt_set_int(*s, "dst_format", outfmt, 0);
-            av_opt_set_int(*s, "sws_flags", scale->flags, 0);
+            av_opt_set_int(*s, "sws_flags", unwarpvr->flags, 0);
 
-            av_opt_set_int(*s, "src_h_chr_pos", scale->in_h_chr_pos, 0);
-            av_opt_set_int(*s, "src_v_chr_pos", scale->in_v_chr_pos, 0);
-            av_opt_set_int(*s, "dst_h_chr_pos", scale->out_h_chr_pos, 0);
-            av_opt_set_int(*s, "dst_v_chr_pos", scale->out_v_chr_pos, 0);
+            av_opt_set_int(*s, "src_h_chr_pos", unwarpvr->in_h_chr_pos, 0);
+            av_opt_set_int(*s, "src_v_chr_pos", unwarpvr->in_v_chr_pos, 0);
+            av_opt_set_int(*s, "dst_h_chr_pos", unwarpvr->out_h_chr_pos, 0);
+            av_opt_set_int(*s, "dst_v_chr_pos", unwarpvr->out_v_chr_pos, 0);
 
             if ((ret = sws_init_context(*s, NULL, NULL)) < 0)
                 return ret;
-            if (!scale->interlaced)
+            if (!unwarpvr->interlaced)
                 break;
         }
     }
@@ -361,14 +486,14 @@ static int config_props(AVFilterLink *outlink)
            inlink->sample_aspect_ratio.num, inlink->sample_aspect_ratio.den,
            outlink->w, outlink->h, av_get_pix_fmt_name(outlink->format),
            outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den,
-           scale->flags);
+           unwarpvr->flags);
     return 0;
 
 fail:
     av_log(NULL, AV_LOG_ERROR,
            "Error when evaluating the expression '%s'.\n"
            "Maybe the expression for out_w:'%s' or for out_h:'%s' is self-referencing.\n",
-           expr, scale->w_expr, scale->h_expr);
+           expr, unwarpvr->w_expr, unwarpvr->h_expr);
     return ret;
 }
 
@@ -449,7 +574,9 @@ float EvalCatmullRom10SplineInv ( float const *K, float const CA0, float const C
 
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
-    AVFilterLink *outlink = link->dst->outputs[0];
+    AVFilterContext *ctx = link->dst;
+    UnwarpVRContext *unwarpvr = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out;
     const uint8_t *src = in->data[0];
 
@@ -460,13 +587,12 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     // ChromaticAbberation varies by eye relief and lerps between the following two arrays
     const float ChromaticAberrationMin[] = {-0.0112f, -0.015f, 0.0187f, 0.015f};
     const float ChromaticAberrationMax[] = {-0.015f, -0.02f, 0.025f, 0.02f};
-    int dial = 5; // 10 for max, 0 for min
     float ChromaticAberration[4];
     static float* inv_cache = NULL;
     float *inv_cache_p;
 
     for (i=0; i < sizeof(ChromaticAberration)/sizeof(*ChromaticAberration); i++) {
-        ChromaticAberration[i] = ChromaticAberrationMin[i] + dial/10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
+        ChromaticAberration[i] = ChromaticAberrationMin[i] + unwarpvr->eye_relief_dial / 10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
     }
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
