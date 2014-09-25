@@ -580,16 +580,16 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     AVFrame *out;
     const uint8_t *src = in->data[0];
 
-    uint8_t *dstrow;
-    int i, j, channel, eye;
+    int i, j, eye;
     // Distortion varies by SDK version but never by cup type or eye relief (in 0.4.2)
     const float K[] = {1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f};
+    const float MetersPerTanAngleAtCenter = 0.036f;
     // ChromaticAbberation varies by eye relief and lerps between the following two arrays
     const float ChromaticAberrationMin[] = {-0.0112f, -0.015f, 0.0187f, 0.015f};
     const float ChromaticAberrationMax[] = {-0.015f, -0.02f, 0.025f, 0.02f};
     float ChromaticAberration[4];
-    static float* inv_cache = NULL;
-    float *inv_cache_p;
+    static int* inv_cache = NULL;
+    int *inv_cache_p;
 
     for (i=0; i < sizeof(ChromaticAberration)/sizeof(*ChromaticAberration); i++) {
         ChromaticAberration[i] = ChromaticAberrationMin[i] + unwarpvr->eye_relief_dial / 10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
@@ -604,80 +604,69 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     out->width  = outlink->w;
     out->height = outlink->h;
 
-    for (eye = 0; eye < 2; eye++) {
-        const float lensCenterXOffset = eye ? 0.00986003876 : -0.00986003876; // For DK2, determined by physical parameters
-
+#define NUM_EYES 2
 #define NUM_CHANNELS 3
-#define NUM_DIMENSIONS 2
-        if (inv_cache == NULL) {
-            // These are from distortion.TanEyeAngleScale.x and distortion.TanEyeAngleScale.y in OVR_Stereo.cpp
-            // TODO: These might vary based on settings
-            const float TanEyeAngleScaleX = 0.874f;
-            const float TanEyeAngleScaleY = 0.9825f;
-            int channel;
 
-            inv_cache = (float *)malloc(sizeof(float) * outlink->w/2 * outlink->h * NUM_CHANNELS * NUM_DIMENSIONS);
-            inv_cache_p = inv_cache;
+    if (inv_cache == NULL) {
+        const float screenWidthMeters = 0.12576f;
+        const float screenHeightMeters = 0.07074f;
+        // As computed in CalculateDistortionRenderDesc() distortion.TanEyeAngleScale in OVR_Stereo.cpp
+        const float TanEyeAngleScaleX = 0.25f * screenWidthMeters / MetersPerTanAngleAtCenter;
+        const float TanEyeAngleScaleY = 0.5f * screenHeightMeters / MetersPerTanAngleAtCenter;
+
+        inv_cache = (int *)malloc(sizeof(int)* outlink->w / 2 * outlink->h * NUM_CHANNELS * NUM_EYES);
+        inv_cache_p = inv_cache;
+        for (eye = 0; eye < NUM_EYES; eye++) {
+            const float lensCenterXOffset = eye ? 0.00986003876 : -0.00986003876; // For DK2, determined by physical parameters
+
             for (i = 0; i < outlink->h; i++) {
-                for (j = 0; j < outlink->w/2; j++) {
-                    float ndcx_raw = (-1.0f + 2.0f * ( j / (float)(outlink->w/2) ));
-                    float ndcy_raw = (-1.0f + 2.0f * ( i / (float)(outlink->h) ));
+                for (j = 0; j < outlink->w / 2; j++) {
+                    int channel;
+                    float ndcx_raw = (-1.0f + 2.0f * (j / (float)(outlink->w / 2)));
+                    float ndcy_raw = (-1.0f + 2.0f * (i / (float)(outlink->h)));
                     // float ndcy_raw = (-1.0f + 2.0f * ( i / (float)(outlink->h) )) / 2.0f; // Fixes aspect ratio for YouTube SBS 3D
-                    float ndcx = ndcx_raw * ((float)outlink->w/in->width) * TanEyeAngleScaleX;
-                    float ndcy = ndcy_raw * ((float)outlink->h/in->height) * TanEyeAngleScaleY;
+                    float ndcx = ndcx_raw * ((float)outlink->w / in->width) * TanEyeAngleScaleX;
+                    float ndcy = ndcy_raw * ((float)outlink->h / in->height) * TanEyeAngleScaleY;
                     float rsq = ndcx*ndcx + ndcy*ndcy;
                     float new_rsq[NUM_CHANNELS];
                     new_rsq[0] = EvalCatmullRom10SplineInv(K, ChromaticAberration[0], ChromaticAberration[1], rsq);
                     new_rsq[1] = EvalCatmullRom10SplineInv(K, 0, 0, rsq);
                     new_rsq[2] = EvalCatmullRom10SplineInv(K, ChromaticAberration[2], ChromaticAberration[3], rsq);
-                    for (channel=0; channel < NUM_CHANNELS; channel++) {
-                        float scale = sqrt(new_rsq[channel]/rsq);
-                        *inv_cache_p = ((float)outlink->w/in->width) * scale;
-                        inv_cache_p++;
-                        *inv_cache_p = ((float)outlink->h/in->height) * scale;
+                    for (channel = 0; channel < NUM_CHANNELS; channel++) {
+                        float x, y;
+                        int srcj, srci;
+                        float ndcx_scaled, ndcy_scaled;
+                        float scale = sqrt(new_rsq[channel] / rsq);
+
+                        ndcx_scaled = ndcx_raw * ((float)outlink->w / in->width) * scale;
+                        ndcy_scaled = ndcy_raw * ((float)outlink->h / in->height) * scale;
+                        x = (ndcx_scaled + lensCenterXOffset + 1.0f) / 2.0f * in->width / 2;
+                        y = (ndcy_scaled + 1.0f) / 2.0f * in->height;
+
+                        srcj = (int)x;
+                        srci = (int)y;
+                        if (srci >= 0 && srcj >= 0 && srci < in->height && srcj < in->width / 2)
+                            *inv_cache_p = (srci*in->linesize[0]) + (eye*in->width / 2 + srcj)*NUM_CHANNELS + channel;
+                        else {
+                            // Optimization trick: upper-left corner should always be fill color
+                            *inv_cache_p = 0;
+                        }
                         inv_cache_p++;
                     }
                 }
             }
         }
+    }
 
-        inv_cache_p = inv_cache;
-        dstrow = out->data[0];
+    inv_cache_p = inv_cache;
+    for (eye = 0; eye < NUM_EYES; eye++) {
+        uint8_t *dst = out->data[0] + eye*outlink-> w / 2 * NUM_CHANNELS;
         for (i = 0; i < outlink->h; i++) {
-            uint8_t *dst = dstrow + eye*outlink->w/2*NUM_CHANNELS;
-
-            for (j = 0; j < outlink->w/2; j++) {
-
-                // Convert render target pixel to NDC (screen resolution ranging from -1 to 1, larger values outside that, based on Oculus's OVR_Stereo.cpp)
-                float ndcx_raw = (-1.0f + 2.0f * ( j / (float)(outlink->w/2) ));
-                float ndcy_raw = (-1.0f + 2.0f * ( i / (float)(outlink->h) ));
-
-                for (channel = 0; channel < 3; channel++, dst++) {
-                    // Convert screen NDC ([-1,1]) to screen pixel
-                    float x, y;
-                    int srcj, srci;
-                    float ndcx_scaled, ndcy_scaled;
-
-                    ndcx_scaled = ndcx_raw * (*inv_cache_p);
-                    inv_cache_p++;
-                    ndcy_scaled = ndcy_raw * (*inv_cache_p);
-                    inv_cache_p++;
-
-                    x = (ndcx_scaled + lensCenterXOffset + 1.0f)/2.0f * in->width/2;
-                    y = (ndcy_scaled + 1.0f)/2.0f * in->height;
-
-                    srcj = (int)x;
-                    srci = (int)y;
-                    if (srci >= 0 && srcj >= 0 && srci < in->height && srcj < in->width/2) {
-                        const uint8_t *srcpix = src + (srci*in->linesize[0]) + (eye*in->width/2 + srcj)*NUM_CHANNELS;
-                        *dst = srcpix[channel];
-                    } else {
-                        *dst = 0;
-                    }
-                }
+            int jlimit = outlink->w / 2 * 3;
+            for (j = 0; j < jlimit; j++, inv_cache_p++, dst++) {
+                *dst = src[*inv_cache_p];
             }
-
-            dstrow += out->linesize[0];
+            dst += out->linesize[0] - jlimit;
         }
     }
 
