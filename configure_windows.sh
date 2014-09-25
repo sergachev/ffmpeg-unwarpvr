@@ -1,1 +1,1 @@
-./configure --enable-gpl --enable-libx264 --extra-cflags=-I/usr/local/include --extra-ldflags=-L/usr/local/lib --enable-encoder=png --enable-static --disable-shared --extra-libs=-static --extra-cflags=--static
+./configure --enable-gpl --enable-libx264 --enable-zlib --enable-libjansson --extra-cflags=-I/usr/local/include --extra-ldflags=-L/usr/local/lib --enable-static --disable-shared --extra-libs=-static --extra-cflags=--static

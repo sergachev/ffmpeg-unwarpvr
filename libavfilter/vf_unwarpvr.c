@@ -29,6 +29,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <jansson.h>
 
 #include "avfilter.h"
 #include "formats.h"
@@ -161,6 +162,12 @@ static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
     }
     scale->opts = *opts;
     *opts = NULL;
+
+    {
+    json_t *root;
+    json_error_t error;
+    json_loads("{\"glossary\": {\"title\": \"example glossary\"}}", 0, &error);
+    }
 
     return 0;
 }
