@@ -122,6 +122,10 @@ typedef struct UnwarpVRContext {
     int in_v_chr_pos;
 
     int force_original_aspect_ratio;
+    int swap_eyes;
+    int left_eye_only;
+    float scale_width;
+    float scale_height;
 
     int eye_relief_dial;
 } UnwarpVRContext;
@@ -129,15 +133,15 @@ typedef struct UnwarpVRContext {
 static av_cold int ovr_parse_error(AVFilterContext *ctx, json_t *root, const char *reason)
 {
     av_log(ctx, AV_LOG_ERROR,
-        "Error encountered parsing Oculus SDK profile (%s).\n", reason);
+        "Error encountered parsing Oculus SDK profile (%s). Set eye relief manually with eye_relief_dial option.\n", reason);
     json_decref(root);
     return AVERROR(EINVAL);
 }
 
-static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
+static av_cold int read_ovr_profile(AVFilterContext *ctx)
 {
     UnwarpVRContext *unwarpvr = ctx->priv;
-    int i, j, ret;
+    int i, j;
     int found_user_profile = 0;
     json_t *root, *json, *tagged_data;
     json_error_t error;
@@ -157,7 +161,7 @@ static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
     root = json_load_file(profile_path, 0, &error);
     if (!root) {
         av_log(ctx, AV_LOG_ERROR,
-            "Could not find Oculus SDK profile. Oculus Runtime may not be installed.\n");
+            "Could not find Oculus SDK profile. Oculus Runtime may not be installed. Set eye relief manually with eye_relief_dial option.\n");
         return AVERROR(EINVAL);
     }
     if (!json_is_object(root))
@@ -244,13 +248,27 @@ static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
             else if (eye_relief_dial != NULL)
                 return ovr_parse_error(ctx, root, "EyeReliefDial is not integer");
             av_log(ctx, AV_LOG_VERBOSE, "Oculus profile settings: eye_relief_dial:%d\n",
-                   unwarpvr->eye_relief_dial);
+                unwarpvr->eye_relief_dial);
             found_user_profile = 1;
         }
     }
     if (!found_user_profile)
         return ovr_parse_error(ctx, root, "could not find user profile for default user for selected device");
     json_decref(root);
+    return 0;
+}
+
+static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
+{
+    UnwarpVRContext *unwarpvr = ctx->priv;
+    int ret;
+
+    if (unwarpvr->eye_relief_dial == -1)
+    {
+        int ret = read_ovr_profile(ctx);
+        if (ret)
+            return ret;
+    }
 
     if (unwarpvr->size_str && (unwarpvr->w_expr || unwarpvr->h_expr)) {
         av_log(ctx, AV_LOG_ERROR,
@@ -580,18 +598,17 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     AVFrame *out;
     const uint8_t *src = in->data[0];
 
-    int i, j, eye;
+    int i, j, eye_count;
     // Distortion varies by SDK version but never by cup type or eye relief (in 0.4.2)
-    const float K[] = {1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f};
+    const float K[] = { 1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f };
     const float MetersPerTanAngleAtCenter = 0.036f;
     // ChromaticAbberation varies by eye relief and lerps between the following two arrays
-    const float ChromaticAberrationMin[] = {-0.0112f, -0.015f, 0.0187f, 0.015f};
-    const float ChromaticAberrationMax[] = {-0.015f, -0.02f, 0.025f, 0.02f};
+    const float ChromaticAberrationMin[] = { -0.0112f, -0.015f, 0.0187f, 0.015f };
+    const float ChromaticAberrationMax[] = { -0.015f, -0.02f, 0.025f, 0.02f };
     float ChromaticAberration[4];
     static int* inv_cache = NULL;
-    int *inv_cache_p;
 
-    for (i=0; i < sizeof(ChromaticAberration)/sizeof(*ChromaticAberration); i++) {
+    for (i = 0; i < sizeof(ChromaticAberration) / sizeof(*ChromaticAberration); i++) {
         ChromaticAberration[i] = ChromaticAberrationMin[i] + unwarpvr->eye_relief_dial / 10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
     }
 
@@ -601,7 +618,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
         return AVERROR(ENOMEM);
     }
     av_frame_copy_props(out, in);
-    out->width  = outlink->w;
+    out->width = outlink->w;
     out->height = outlink->h;
 
 #define NUM_EYES 2
@@ -614,17 +631,23 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
         const float TanEyeAngleScaleX = 0.25f * screenWidthMeters / MetersPerTanAngleAtCenter;
         const float TanEyeAngleScaleY = 0.5f * screenHeightMeters / MetersPerTanAngleAtCenter;
 
-        inv_cache = (int *)malloc(sizeof(int)* outlink->w / 2 * outlink->h * NUM_CHANNELS * NUM_EYES);
-        inv_cache_p = inv_cache;
-        for (eye = 0; eye < NUM_EYES; eye++) {
-            const float lensCenterXOffset = eye ? 0.00986003876 : -0.00986003876; // For DK2, determined by physical parameters
+        // Optimization trick: upper-left corner should always be fill color, so zero index will work
+        inv_cache = (int *)calloc(sizeof(int), outlink->w * outlink->h * NUM_CHANNELS);
+        for (eye_count = 0; eye_count < NUM_EYES; eye_count++) {
+            int one_eye_multiplier = unwarpvr->left_eye_only ? 2 : 1;
+            float lensCenterXOffset;
+            int eye = eye_count;
+            if (unwarpvr->left_eye_only && eye > 0)
+                break;
+            if (unwarpvr->swap_eyes)
+                eye = 1 - eye;
+            lensCenterXOffset = eye ? 0.00986003876 : -0.00986003876; // For DK2, determined by physical parameters
 
             for (i = 0; i < outlink->h; i++) {
-                for (j = 0; j < outlink->w / 2; j++) {
+                for (j = 0; j < outlink->w / 2 * one_eye_multiplier; j++) {
                     int channel;
-                    float ndcx_raw = (-1.0f + 2.0f * (j / (float)(outlink->w / 2)));
-                    float ndcy_raw = (-1.0f + 2.0f * (i / (float)(outlink->h)));
-                    // float ndcy_raw = (-1.0f + 2.0f * ( i / (float)(outlink->h) )) / 2.0f; // Fixes aspect ratio for YouTube SBS 3D
+                    float ndcx_raw = (-1.0f + 2.0f * (j / (float)(outlink->w / 2 * one_eye_multiplier))) * one_eye_multiplier / unwarpvr->scale_width;
+                    float ndcy_raw = (-1.0f + 2.0f * (i / (float)(outlink->h))) / unwarpvr->scale_height;
                     float ndcx = ndcx_raw * ((float)outlink->w / in->width) * TanEyeAngleScaleX;
                     float ndcy = ndcy_raw * ((float)outlink->h / in->height) * TanEyeAngleScaleY;
                     float rsq = ndcx*ndcx + ndcy*ndcy;
@@ -637,6 +660,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
                         int srcj, srci;
                         float ndcx_scaled, ndcy_scaled;
                         float scale = sqrt(new_rsq[channel] / rsq);
+                        int output_idx = (i*outlink->w + eye_count*outlink->w / 2 + j)*NUM_CHANNELS + channel;
 
                         ndcx_scaled = ndcx_raw * ((float)outlink->w / in->width) * scale;
                         ndcy_scaled = ndcy_raw * ((float)outlink->h / in->height) * scale;
@@ -645,28 +669,25 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
                         srcj = (int)x;
                         srci = (int)y;
+
                         if (srci >= 0 && srcj >= 0 && srci < in->height && srcj < in->width / 2)
-                            *inv_cache_p = (srci*in->linesize[0]) + (eye*in->width / 2 + srcj)*NUM_CHANNELS + channel;
-                        else {
-                            // Optimization trick: upper-left corner should always be fill color
-                            *inv_cache_p = 0;
-                        }
-                        inv_cache_p++;
+                            inv_cache[output_idx] = (srci*in->linesize[0]) + (eye*in->width / 2 + srcj)*NUM_CHANNELS + channel;
                     }
                 }
             }
         }
     }
 
-    inv_cache_p = inv_cache;
-    for (eye = 0; eye < NUM_EYES; eye++) {
-        uint8_t *dst = out->data[0] + eye*outlink-> w / 2 * NUM_CHANNELS;
+    {
+        uint8_t *dst = out->data[0];
+        int *inv_cache_p = inv_cache;
+        int jlimit = outlink->w * NUM_CHANNELS;
+        int end_of_line_size = out->linesize[0] - jlimit;
         for (i = 0; i < outlink->h; i++) {
-            int jlimit = outlink->w / 2 * 3;
             for (j = 0; j < jlimit; j++, inv_cache_p++, dst++) {
                 *dst = src[*inv_cache_p];
             }
-            dst += out->linesize[0] - jlimit;
+            dst += end_of_line_size;
         }
     }
 
@@ -709,6 +730,11 @@ static const AVOption unwarpvr_options[] = {
     { "disable",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 0 }, 0, 0, FLAGS, "force_oar" },
     { "decrease", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 1 }, 0, 0, FLAGS, "force_oar" },
     { "increase", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 2 }, 0, 0, FLAGS, "force_oar" },
+    { "swap_eyes", "swap the two eye views", OFFSET(swap_eyes), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
+    { "left_eye_only", "render only the left eye view", OFFSET(left_eye_only), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
+    { "scale_width", "scales width of output (1.0 for none)", OFFSET(scale_width), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
+    { "scale_height", "scales height of output (1.0 for none)", OFFSET(scale_height), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
+    { "eye_relief_dial", "setting of eye relief dial at time of recording (0-10, 10 is farthest out)", OFFSET(eye_relief_dial), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 10, FLAGS },
     { NULL }
 };
 
