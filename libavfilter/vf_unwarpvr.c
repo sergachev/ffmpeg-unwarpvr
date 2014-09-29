@@ -50,8 +50,7 @@
 #include <windows.h>
 const char *unexpanded_profile_path = "%USERPROFILE%\\AppData\\Local\\Oculus\\ProfileDB.json";
 #else
-const char *profile_path = "ProfileDB.json";
-hfdsjknfkjsdn // TODO! Profile path on Linux
+const char *unexpanded_profile_path = NULL;
 #endif
 
 static const char *const var_names[] = {
@@ -126,8 +125,17 @@ typedef struct UnwarpVRContext {
     int left_eye_only;
     float scale_width;
     float scale_height;
+    float scale_in_width;
+    float scale_in_height;
 
     int eye_relief_dial;
+    int forward_warp;
+    float ppd;
+    char *device;
+    char *sdkversion;
+    int mono_input;
+
+    int* inv_cache;
 } UnwarpVRContext;
 
 static av_cold int ovr_parse_error(AVFilterContext *ctx, json_t *root, const char *reason)
@@ -146,13 +154,13 @@ static av_cold int read_ovr_profile(AVFilterContext *ctx)
     json_t *root, *json, *tagged_data;
     json_error_t error;
     const char* default_user = NULL;
-    const char* selected_product = "RiftDK2";
+    const char* selected_product = unwarpvr->device;
 
 #ifdef _WIN32
     char profile_path[FILENAME_MAX + 1];
     ExpandEnvironmentStrings(unexpanded_profile_path, profile_path, sizeof(profile_path) / sizeof(*profile_path));
 #else
-    hfdsjknfkjsdn // TODO!
+    char* profile_path = ""; // No Oculus SDK for Linux for DK2 yet. TODO: Make this work for DK1 at least.
 #endif
 
     // Default settings if not specified in JSON
@@ -258,10 +266,61 @@ static av_cold int read_ovr_profile(AVFilterContext *ctx)
     return 0;
 }
 
+static av_cold char* join_string_list(char* buffer, const size_t size, const char** list, const char* separator)
+{
+    if (*list == NULL) {
+        strcpy(buffer, "");
+        return buffer;
+    }
+    strncpy(buffer, *list, size);
+    for (list++; *list; list++) {
+        snprintf(buffer, size, "%s%s%s", buffer, separator, *list);
+    }
+    buffer[size - 1] = '\0'; // In case strncpy/snprintf didn't write a null terminator
+    return buffer;
+}
+
 static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
 {
     UnwarpVRContext *unwarpvr = ctx->priv;
-    int ret;
+    int i, j, ret;
+
+    char buffer[1024];
+    const char *valid_devices[] = { "RiftDK1", "RiftDK2", NULL };
+    const char *valid_sdk_versions[][128] = {
+        { "0.2.5c", "0.4.2", NULL }, // RiftDK1
+        { "0.4.2", NULL }, // RiftDK2
+    };
+    for (i = 0; valid_devices[i] != NULL; i++) {
+        if (strcmp(unwarpvr->device, valid_devices[i]) == 0) {
+            if (strcmp(unwarpvr->sdkversion, "default") == 0)
+                strcpy(unwarpvr->sdkversion, valid_sdk_versions[i][0]);
+            for (j = 0; valid_sdk_versions[j] != NULL; j++) {
+                if (strcmp(unwarpvr->sdkversion, valid_sdk_versions[i][j]) == 0)
+                    break;
+            }
+            if (valid_sdk_versions[i][j] == NULL) {
+                av_log(ctx, AV_LOG_ERROR,
+                    "Invalid SDK version specified. Valid options: %s\n",
+                    join_string_list(buffer, sizeof(buffer), valid_sdk_versions[i], ", "));
+                return AVERROR(EINVAL);
+            }
+            break;
+        }
+    }
+    if (valid_devices[i] == NULL) {
+        av_log(ctx, AV_LOG_ERROR,
+            "unwarpvr: Invalid device specified. Valid options: %s\n",
+            join_string_list(buffer, sizeof(buffer), valid_devices, ", "));
+        return AVERROR(EINVAL);
+    }
+
+    if (valid_devices[i] == NULL) {
+        av_log(ctx, AV_LOG_ERROR,
+            "unwarpvr: Invalid device specified. Valid options: %s\n",
+            join_string_list(buffer, sizeof(buffer), valid_devices, ", "));
+        return AVERROR(EINVAL);
+    }
 
     if (unwarpvr->eye_relief_dial == -1)
     {
@@ -270,9 +329,14 @@ static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
             return ret;
     }
 
+    if (unwarpvr->ppd != 0.0f && !unwarpvr->forward_warp) {
+        av_log(ctx, AV_LOG_ERROR, "ppd parameter only valid when forward_warp=1\n");
+        return AVERROR(EINVAL);
+    }
+
     if (unwarpvr->size_str && (unwarpvr->w_expr || unwarpvr->h_expr)) {
         av_log(ctx, AV_LOG_ERROR,
-               "Size and width/height expressions cannot be set at the same time.\n");
+            "Size and width/height expressions cannot be set at the same time.\n");
         return AVERROR(EINVAL);
     }
 
@@ -315,6 +379,117 @@ static av_cold int init_dict(AVFilterContext *ctx, AVDictionary **opts)
     return 0;
 }
 
+const int NumSegments = 11;
+
+// From OVR_Stereo.cpp, evaluates Catmull-Rom spline based on provided K values
+static float EvalCatmullRom10Spline(float const *K, float scaledVal)
+{
+    float t, omt, res;
+    float p0, p1;
+    float m0, m1;
+    int k;
+
+    float scaledValFloor = floorf(scaledVal);
+    scaledValFloor = fmaxf(0.0f, fminf((float)(NumSegments - 1), scaledValFloor));
+    t = scaledVal - scaledValFloor;
+    k = (int)scaledValFloor;
+
+    switch (k)
+    {
+    case 0:
+        // Curve starts at 1.0 with gradient K[1]-K[0]
+        p0 = 1.0f;
+        m0 = (K[1] - K[0]);    // general case would have been (K[1]-K[-1])/2
+        p1 = K[1];
+        m1 = 0.5f * (K[2] - K[0]);
+        break;
+    default:
+        // General case
+        p0 = K[k];
+        m0 = 0.5f * (K[k + 1] - K[k - 1]);
+        p1 = K[k + 1];
+        m1 = 0.5f * (K[k + 2] - K[k]);
+        break;
+    case NumSegments - 2:
+        // Last tangent is just the slope of the last two points.
+        p0 = K[NumSegments - 2];
+        m0 = 0.5f * (K[NumSegments - 1] - K[NumSegments - 2]);
+        p1 = K[NumSegments - 1];
+        m1 = K[NumSegments - 1] - K[NumSegments - 2];
+        break;
+    case NumSegments - 1:
+        // Beyond the last segment it's just a straight line
+        p0 = K[NumSegments - 1];
+        m0 = K[NumSegments - 1] - K[NumSegments - 2];
+        p1 = p0 + m0;
+        m1 = m0;
+        break;
+    }
+
+    omt = 1.0f - t;
+    res = (p0 * (1.0f + 2.0f *   t) + m0 *   t) * omt * omt
+        + (p1 * (1.0f + 2.0f * omt) - m1 * omt) *   t *   t;
+
+    return res;
+}
+
+// From OVR_DeviceConstants.h
+enum DistortionEqnType
+{
+    Distortion_Poly4 = 0,
+    Distortion_RecipPoly4 = 1,
+    Distortion_CatmullRom10 = 2,
+};
+
+// Also based on function from OVR_Stereo.cpp
+static float DistortionFnScaleRadiusSquared(enum DistortionEqnType Eqn, float const *K, float MaxR, float const CA0, float const CA1, float rsq)
+{
+    float scale = 1.0f;
+    switch (Eqn)
+    {
+    case Distortion_Poly4:
+        // This version is deprecated! Prefer one of the other two.
+        scale = (K[0] + rsq * (K[1] + rsq * (K[2] + rsq * K[3])));
+        break;
+    case Distortion_RecipPoly4:
+        scale = 1.0f / (K[0] + rsq * (K[1] + rsq * (K[2] + rsq * K[3])));
+        break;
+    case Distortion_CatmullRom10:{
+                                     // A Catmull-Rom spline through the values 1.0, K[1], K[2] ... K[10]
+                                     // evenly spaced in R^2 from 0.0 to MaxR^2
+                                     // K[0] controls the slope at radius=0.0, rather than the actual value.
+                                     float scaledRsq = (float)(NumSegments - 1) * rsq / (MaxR * MaxR);
+                                     scale = EvalCatmullRom10Spline(K, scaledRsq);
+    }break;
+    }
+    scale *= 1.0f + CA0 + CA1 * rsq;
+    return scale;
+}
+
+// Computes inverse of DistortionFnScaleRadiusSquared function using binary search
+// Function is monotonic increasing so this ought to work, although might be slow
+static float DistortionFnScaleRadiusSquaredInv(enum DistortionEqnType Eqn, float const *K, float MaxR, float const CA0, float const CA1, float rsq)
+{
+    float low_guess = 0.0f, high_guess = 10.0f;
+    // The "high_guess > 0.00001" is needed for the singular case where zero is the solution
+    // With the relative error at 0.001 I observed a dot in the center on some frames, so lowered to 0.0001
+    while ((high_guess - low_guess) / low_guess > 0.0001 && high_guess > 0.00001) {
+        float mid_guess = (low_guess + high_guess) / 2.0f;
+        float scale = DistortionFnScaleRadiusSquared(Eqn, K, MaxR, CA0, CA1, mid_guess);
+        float mid_guess_value = scale * scale * mid_guess;
+        if (rsq < mid_guess_value) {
+            high_guess = mid_guess;
+        }
+        else {
+            low_guess = mid_guess;
+        }
+    }
+    return (low_guess + high_guess) / 2.0f;
+}
+
+#define NUM_EYES 2
+#define NUM_CHANNELS 3
+
 static av_cold void uninit(AVFilterContext *ctx)
 {
     UnwarpVRContext *unwarpvr = ctx->priv;
@@ -323,6 +498,7 @@ static av_cold void uninit(AVFilterContext *ctx)
     sws_freeContext(unwarpvr->isws[1]);
     unwarpvr->sws = NULL;
     av_dict_free(&unwarpvr->opts);
+    av_freep(&unwarpvr->inv_cache);
 }
 
 static int query_formats(AVFilterContext *ctx)
@@ -474,8 +650,8 @@ static int config_props(AVFilterLink *outlink)
                 }
             }
 
-            av_opt_set_int(*s, "srcw", inlink ->w, 0);
-            av_opt_set_int(*s, "srch", inlink ->h >> !!i, 0);
+            av_opt_set_int(*s, "srcw", inlink->w, 0);
+            av_opt_set_int(*s, "srch", inlink->h >> !!i, 0);
             av_opt_set_int(*s, "src_format", inlink->format, 0);
             av_opt_set_int(*s, "dstw", outlink->w, 0);
             av_opt_set_int(*s, "dsth", outlink->h >> !!i, 0);
@@ -500,11 +676,206 @@ static int config_props(AVFilterLink *outlink)
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
 
     av_log(ctx, AV_LOG_VERBOSE, "w:%d h:%d fmt:%s sar:%d/%d -> w:%d h:%d fmt:%s sar:%d/%d flags:0x%0x\n",
-           inlink ->w, inlink ->h, av_get_pix_fmt_name( inlink->format),
+           inlink->w, inlink->h, av_get_pix_fmt_name( inlink->format),
            inlink->sample_aspect_ratio.num, inlink->sample_aspect_ratio.den,
            outlink->w, outlink->h, av_get_pix_fmt_name(outlink->format),
            outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den,
            unwarpvr->flags);
+
+    // Initialize inv_cache
+    {
+        int i, j, eye_count;
+        float MetersPerTanAngleAtCenter;
+        float screenWidthMeters;
+        float screenHeightMeters;
+        float LensCenterXOffset; // For left eye, determined by physical parameters
+        float TanEyeAngleScaleX, TanEyeAngleScaleY, DevicePPDInCenterX, DevicePPDInCenterY;
+        enum DistortionEqnType Eqn = Distortion_CatmullRom10;
+        float K[11];
+        float MaxR = 1.0f;
+        float ChromaticAberration[4];
+        int DeviceResX, DeviceResY;
+        int channel;
+        int in_linesize;
+
+        // Create temporary input frame just so we can get its linesize
+        AVFrame* in = ff_get_video_buffer(inlink, inlink->w, inlink->h);
+        if (!in) {
+            av_frame_free(&in);
+            return AVERROR(ENOMEM);
+        }
+        in_linesize = in->linesize[0];
+        av_frame_free(&in);
+
+        if (strcmp(unwarpvr->device, "RiftDK1") == 0) {
+            MetersPerTanAngleAtCenter = 0.0425f;
+            screenWidthMeters = 0.14976f;
+            screenHeightMeters = screenWidthMeters / (1280.0f / 800.0f);
+            LensCenterXOffset = 0.15197646600f;
+            DeviceResX = 1280; DeviceResY = 800;
+
+            if (strcmp(unwarpvr->sdkversion, "0.2.5c") == 0) {
+                const float K_DK1[] = { 1.0f, 0.212f, 0.24f, 0.0f };
+                const float ChromaticAberrationDK1[] = { 0.996f - 1.0f, -0.004f, 1.014f - 1.0f, 0.0f };
+                Eqn = Distortion_Poly4;
+                memmove(K, K_DK1, sizeof(K));
+                memmove(ChromaticAberration, ChromaticAberrationDK1, sizeof(ChromaticAberration));
+                MetersPerTanAngleAtCenter = 0.25f * screenWidthMeters; // Ensures TanEyeAngleScaleX = 1.0 to match 0.2.5c behavior
+            }
+            else if (strcmp(unwarpvr->sdkversion, "0.4.2") == 0) {
+                // Use minimum eye relief distortion for now, but should be adjusted with eye relief
+                const float K_DK1[] = { 1.0f, 1.06505f, 1.14725f, 1.2705f, 1.48f, 1.87f, 2.534f, 3.6f, 5.1f, 7.4f, 11.0f };
+                const float ChromaticAberrationDK1[] = { -0.006f, 0.0f, 0.014f, 0.0f };
+                memmove(K, K_DK1, sizeof(K));
+                MaxR = sqrt(1.8f);
+                // ChromaticAbberation does not vary by eye relief in DK1 in SDK 0.4.2
+                memmove(ChromaticAberration, ChromaticAberrationDK1, sizeof(ChromaticAberration));
+            }
+            else {
+                av_log(ctx, AV_LOG_ERROR, "Internal error: unhandled SDK version %s\n", unwarpvr->sdkversion);
+                return AVERROR(EINVAL);
+            }
+        }
+        else if (strcmp(unwarpvr->device, "RiftDK2") == 0) {
+            // Distortion varies by SDK version but never by cup type or eye relief (for DK2 in 0.4.2)
+            const float K_DK2[] = { 1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f };
+            // ChromaticAbberation varies by eye relief and lerps between the following two arrays
+            const float ChromaticAberrationMin[] = { -0.0112f, -0.015f, 0.0187f, 0.015f };
+            const float ChromaticAberrationMax[] = { -0.015f, -0.02f, 0.025f, 0.02f };
+            memmove(K, K_DK2, sizeof(K));
+            for (i = 0; i < sizeof(ChromaticAberration) / sizeof(*ChromaticAberration); i++) {
+                ChromaticAberration[i] = ChromaticAberrationMin[i] + unwarpvr->eye_relief_dial / 10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
+            }
+
+            MetersPerTanAngleAtCenter = 0.036f;
+            screenWidthMeters = 0.12576f;
+            screenHeightMeters = 0.07074f;
+            LensCenterXOffset = -0.00986003876f;
+            DeviceResX = 1920; DeviceResY = 1080;
+        }
+        else {
+            av_log(ctx, AV_LOG_ERROR,
+                "Invalid device specified. Valid options: RiftDK1, RiftDK2\n");
+            return AVERROR(EINVAL);
+        }
+
+        DevicePPDInCenterX = MetersPerTanAngleAtCenter / screenWidthMeters * DeviceResX;
+        DevicePPDInCenterY = MetersPerTanAngleAtCenter / screenHeightMeters * DeviceResY;
+
+        if (unwarpvr->ppd != 0.0f) {
+            unwarpvr->scale_in_width *= (unwarpvr->ppd * 53.1301f) / DevicePPDInCenterX; // 53.1301 deg = tan(0.5) - (tan-0.5)
+            unwarpvr->scale_in_height *= (unwarpvr->ppd * 53.1301f) / DevicePPDInCenterY;
+        }
+
+        // As computed in CalculateDistortionRenderDesc() distortion.TanEyeAngleScale in OVR_Stereo.cpp
+        TanEyeAngleScaleX = 0.25f * screenWidthMeters / MetersPerTanAngleAtCenter;
+        TanEyeAngleScaleY = 0.5f * screenHeightMeters / MetersPerTanAngleAtCenter;
+
+        unwarpvr->inv_cache = av_malloc_array(outlink->w * outlink->h * NUM_CHANNELS, sizeof(int));
+        if (!unwarpvr->inv_cache)
+        {
+            av_log(ctx, AV_LOG_ERROR, "unwarpvr: Out of memory allocating cache\n");
+            return AVERROR(EINVAL);
+        }
+        for (i = 0; i < outlink->h * outlink->w * NUM_CHANNELS; i++) {
+            unwarpvr->inv_cache[i] = -1;
+        }
+        for (eye_count = 0; eye_count < NUM_EYES; eye_count++) {
+            int one_eye_multiplier = unwarpvr->left_eye_only ? 2 : 1;
+            float lensCenterXOffsetEye;
+            int in_eye = eye_count;
+            int out_eye = eye_count;
+            int in_width_per_eye = unwarpvr->mono_input ? inlink->w : inlink->w / 2;
+            if (unwarpvr->left_eye_only && eye_count > 0)
+                break;
+            if (unwarpvr->swap_eyes)
+                in_eye = 1 - in_eye;
+            if (unwarpvr->mono_input)
+                in_eye = 0;
+            lensCenterXOffsetEye = ((!unwarpvr->forward_warp && in_eye) || (unwarpvr->forward_warp && out_eye)) ? -LensCenterXOffset : LensCenterXOffset;
+
+            if (!unwarpvr->forward_warp)
+            {
+                for (i = 0; i < outlink->h; i++) {
+                    for (j = 0; j < outlink->w / 2 * one_eye_multiplier; j++) {
+                        float ndcx_raw, ndcy_raw, ndcx, ndcy, rsq;
+                        float new_rsq[NUM_CHANNELS];
+
+                        ndcx_raw = ((-1.0f + 2.0f * (j / (float)(outlink->w / 2 * one_eye_multiplier))) * one_eye_multiplier) / unwarpvr->scale_width;
+                        ndcy_raw = (-1.0f + 2.0f * (i / (float)(outlink->h))) / unwarpvr->scale_height;
+                        ndcx = ndcx_raw * ((float)outlink->w / DeviceResX); // Scale so changing input/output resolution only affects cropping, not scaling
+                        ndcy = ndcy_raw * ((float)outlink->h / DeviceResY);
+                        ndcx *= TanEyeAngleScaleX;
+                        ndcy *= TanEyeAngleScaleY;
+                        rsq = ndcx*ndcx + ndcy*ndcy;
+                        new_rsq[0] = DistortionFnScaleRadiusSquaredInv(Eqn, K, MaxR, ChromaticAberration[0], ChromaticAberration[1], rsq);
+                        new_rsq[1] = DistortionFnScaleRadiusSquaredInv(Eqn, K, MaxR, 0, 0, rsq);
+                        new_rsq[2] = DistortionFnScaleRadiusSquaredInv(Eqn, K, MaxR, ChromaticAberration[2], ChromaticAberration[3], rsq);
+                        for (channel = 0; channel < NUM_CHANNELS; channel++) {
+                            float x, y;
+                            int srcj, srci;
+                            float ndcx_scaled, ndcy_scaled;
+                            float scale = sqrt(new_rsq[channel] / rsq);
+                            int output_idx = (i*outlink->w + eye_count*outlink->w / 2 + j)*NUM_CHANNELS + channel;
+
+                            ndcx_scaled = ndcx * scale;
+                            ndcy_scaled = ndcy * scale;
+                            ndcx_scaled /= TanEyeAngleScaleX;
+                            ndcy_scaled /= TanEyeAngleScaleY;
+                            x = ((ndcx_scaled + lensCenterXOffsetEye) * unwarpvr->scale_in_width + 1.0f) / 2.0f * in_width_per_eye;
+                            y = (ndcy_scaled * unwarpvr->scale_in_height + 1.0f) / 2.0f * inlink->h;
+
+                            srcj = (int)x;
+                            srci = (int)y;
+
+                            if (srci >= 0 && srcj >= 0 && srci < inlink->h && srcj < in_width_per_eye)
+                                unwarpvr->inv_cache[output_idx] = (srci*in_linesize) + (in_eye * in_width_per_eye + srcj)*NUM_CHANNELS + channel;
+                        }
+                    }
+                }
+            }
+            else // if (unwarpvr->forward_warp)
+            {
+                for (i = 0; i < outlink->h; i++) {
+                    for (j = 0; j < outlink->w / 2 * one_eye_multiplier; j++) {
+                        float ndcx, ndcy, tanx_distorted, tany_distorted, rsq;
+                        float scale[NUM_CHANNELS];
+
+                        ndcx = ((-1.0f + 2.0f * j / (outlink->w / 2 * one_eye_multiplier)) * one_eye_multiplier) / unwarpvr->scale_width - lensCenterXOffsetEye;
+                        ndcy = (-1.0f + 2.0f * i / outlink->h) / unwarpvr->scale_height;
+                        tanx_distorted = ndcx * TanEyeAngleScaleX;
+                        tany_distorted = ndcy * TanEyeAngleScaleY;
+                        rsq = tanx_distorted*tanx_distorted + tany_distorted*tany_distorted;
+                        scale[0] = DistortionFnScaleRadiusSquared(Eqn, K, MaxR, ChromaticAberration[0], ChromaticAberration[1], rsq);
+                        scale[1] = DistortionFnScaleRadiusSquared(Eqn, K, MaxR, 0, 0, rsq);
+                        scale[2] = DistortionFnScaleRadiusSquared(Eqn, K, MaxR, ChromaticAberration[2], ChromaticAberration[3], rsq);
+                        for (channel = 0; channel < NUM_CHANNELS; channel++) {
+                            float x, y;
+                            int srcj, srci;
+                            float tanx, tany, rt_ndcx, rt_ndcy;
+                            int output_idx = (i*outlink->w + eye_count*outlink->w / 2 + j)*NUM_CHANNELS + channel;
+
+                            tanx = tanx_distorted * scale[channel];
+                            tany = tany_distorted * scale[channel];
+
+                            rt_ndcx = tanx / TanEyeAngleScaleX;
+                            rt_ndcy = tany / TanEyeAngleScaleY;
+
+                            x = (rt_ndcx * unwarpvr->scale_in_width / 2.0f * DeviceResX / 2) + (in_width_per_eye / 2.0f);
+                            y = (rt_ndcy * unwarpvr->scale_in_height / 2.0f * DeviceResY) + (inlink->h / 2.0f);
+
+                            srcj = (int)x;
+                            srci = (int)y;
+
+                            if (srci >= 0 && srcj >= 0 && srci < inlink->h && srcj < in_width_per_eye)
+                                unwarpvr->inv_cache[output_idx] = (srci*in_linesize) + (in_eye * in_width_per_eye + srcj)*NUM_CHANNELS + channel;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return 0;
 
 fail:
@@ -515,81 +886,6 @@ fail:
     return ret;
 }
 
-const int NumSegments = 11;
-
-// From OVR_Stereo.cpp, evaluates Catmull-Rom spline based on provided K values
-float EvalCatmullRom10Spline ( float const *K, float scaledVal );
-float EvalCatmullRom10Spline ( float const *K, float scaledVal )
-{
-    float t, omt, res;
-    float p0, p1;
-    float m0, m1;
-    int k;
-
-    float scaledValFloor = floorf ( scaledVal );
-    scaledValFloor = fmaxf ( 0.0f, fminf ( (float)(NumSegments-1), scaledValFloor ) );
-    t = scaledVal - scaledValFloor;
-    k = (int)scaledValFloor;
-
-    switch ( k )
-    {
-    case 0:
-        // Curve starts at 1.0 with gradient K[1]-K[0]
-        p0 = 1.0f;
-        m0 =        ( K[1] - K[0] );    // general case would have been (K[1]-K[-1])/2
-        p1 = K[1];
-        m1 = 0.5f * ( K[2] - K[0] );
-        break;
-    default:
-        // General case
-        p0 = K[k  ];
-        m0 = 0.5f * ( K[k+1] - K[k-1] );
-        p1 = K[k+1];
-        m1 = 0.5f * ( K[k+2] - K[k  ] );
-        break;
-    case NumSegments-2:
-        // Last tangent is just the slope of the last two points.
-        p0 = K[NumSegments-2];
-        m0 = 0.5f * ( K[NumSegments-1] - K[NumSegments-2] );
-        p1 = K[NumSegments-1];
-        m1 = K[NumSegments-1] - K[NumSegments-2];
-        break;
-    case NumSegments-1:
-        // Beyond the last segment it's just a straight line
-        p0 = K[NumSegments-1];
-        m0 = K[NumSegments-1] - K[NumSegments-2];
-        p1 = p0 + m0;
-        m1 = m0;
-        break;
-    }
-
-    omt = 1.0f - t;
-    res  = ( p0 * ( 1.0f + 2.0f *   t ) + m0 *   t ) * omt * omt
-         + ( p1 * ( 1.0f + 2.0f * omt ) - m1 * omt ) *   t *   t;
-
-    return res;
-}
-
-// Computes inverse of CatmullRom spline function using binary search
-// Function is monotonic increasing so this ought to work, although might be slow
-float EvalCatmullRom10SplineInv ( float const *K, float const CA0, float const CA1, float scaledVal );
-float EvalCatmullRom10SplineInv ( float const *K, float const CA0, float const CA1, float scaledVal ) {
-    float low_guess = 0.0f, high_guess=1.5f;
-    // The "high_guess > 0.00001" is needed for the singular case where zero is the solution
-    // With the relative error at 0.001 I observed a dot in the center on some frames, so lowered to 0.0001
-    while ((high_guess - low_guess)/low_guess > 0.0001 && high_guess > 0.00001) {
-        float mid_guess = (low_guess + high_guess)/2.0f;
-        float scale = EvalCatmullRom10Spline(K, (float)(NumSegments - 1) * mid_guess) * (1.0f + CA0 + CA1 * mid_guess);
-        float mid_guess_value = scale * scale * mid_guess;
-        if (scaledVal < mid_guess_value) {
-            high_guess = mid_guess;
-        } else {
-            low_guess = mid_guess;
-        }
-    }
-    return low_guess;
-}
-
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
     AVFilterContext *ctx = link->dst;
@@ -597,20 +893,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out;
     const uint8_t *src = in->data[0];
-
-    int i, j, eye_count;
-    // Distortion varies by SDK version but never by cup type or eye relief (in 0.4.2)
-    const float K[] = { 1.003f, 1.02f, 1.042f, 1.066f, 1.094f, 1.126f, 1.162f, 1.203f, 1.25f, 1.31f, 1.38f };
-    const float MetersPerTanAngleAtCenter = 0.036f;
-    // ChromaticAbberation varies by eye relief and lerps between the following two arrays
-    const float ChromaticAberrationMin[] = { -0.0112f, -0.015f, 0.0187f, 0.015f };
-    const float ChromaticAberrationMax[] = { -0.015f, -0.02f, 0.025f, 0.02f };
-    float ChromaticAberration[4];
-    static int* inv_cache = NULL;
-
-    for (i = 0; i < sizeof(ChromaticAberration) / sizeof(*ChromaticAberration); i++) {
-        ChromaticAberration[i] = ChromaticAberrationMin[i] + unwarpvr->eye_relief_dial / 10.0f * (ChromaticAberrationMax[i] - ChromaticAberrationMin[i]);
-    }
+    int i, j;
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
@@ -621,71 +904,14 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     out->width = outlink->w;
     out->height = outlink->h;
 
-#define NUM_EYES 2
-#define NUM_CHANNELS 3
-
-    if (inv_cache == NULL) {
-        const float screenWidthMeters = 0.12576f;
-        const float screenHeightMeters = 0.07074f;
-        // As computed in CalculateDistortionRenderDesc() distortion.TanEyeAngleScale in OVR_Stereo.cpp
-        const float TanEyeAngleScaleX = 0.25f * screenWidthMeters / MetersPerTanAngleAtCenter;
-        const float TanEyeAngleScaleY = 0.5f * screenHeightMeters / MetersPerTanAngleAtCenter;
-
-        // Optimization trick: upper-left corner should always be fill color, so zero index will work
-        inv_cache = (int *)calloc(sizeof(int), outlink->w * outlink->h * NUM_CHANNELS);
-        for (eye_count = 0; eye_count < NUM_EYES; eye_count++) {
-            int one_eye_multiplier = unwarpvr->left_eye_only ? 2 : 1;
-            float lensCenterXOffset;
-            int eye = eye_count;
-            if (unwarpvr->left_eye_only && eye > 0)
-                break;
-            if (unwarpvr->swap_eyes)
-                eye = 1 - eye;
-            lensCenterXOffset = eye ? 0.00986003876 : -0.00986003876; // For DK2, determined by physical parameters
-
-            for (i = 0; i < outlink->h; i++) {
-                for (j = 0; j < outlink->w / 2 * one_eye_multiplier; j++) {
-                    int channel;
-                    float ndcx_raw = (-1.0f + 2.0f * (j / (float)(outlink->w / 2 * one_eye_multiplier))) * one_eye_multiplier / unwarpvr->scale_width;
-                    float ndcy_raw = (-1.0f + 2.0f * (i / (float)(outlink->h))) / unwarpvr->scale_height;
-                    float ndcx = ndcx_raw * ((float)outlink->w / in->width) * TanEyeAngleScaleX;
-                    float ndcy = ndcy_raw * ((float)outlink->h / in->height) * TanEyeAngleScaleY;
-                    float rsq = ndcx*ndcx + ndcy*ndcy;
-                    float new_rsq[NUM_CHANNELS];
-                    new_rsq[0] = EvalCatmullRom10SplineInv(K, ChromaticAberration[0], ChromaticAberration[1], rsq);
-                    new_rsq[1] = EvalCatmullRom10SplineInv(K, 0, 0, rsq);
-                    new_rsq[2] = EvalCatmullRom10SplineInv(K, ChromaticAberration[2], ChromaticAberration[3], rsq);
-                    for (channel = 0; channel < NUM_CHANNELS; channel++) {
-                        float x, y;
-                        int srcj, srci;
-                        float ndcx_scaled, ndcy_scaled;
-                        float scale = sqrt(new_rsq[channel] / rsq);
-                        int output_idx = (i*outlink->w + eye_count*outlink->w / 2 + j)*NUM_CHANNELS + channel;
-
-                        ndcx_scaled = ndcx_raw * ((float)outlink->w / in->width) * scale;
-                        ndcy_scaled = ndcy_raw * ((float)outlink->h / in->height) * scale;
-                        x = (ndcx_scaled + lensCenterXOffset + 1.0f) / 2.0f * in->width / 2;
-                        y = (ndcy_scaled + 1.0f) / 2.0f * in->height;
-
-                        srcj = (int)x;
-                        srci = (int)y;
-
-                        if (srci >= 0 && srcj >= 0 && srci < in->height && srcj < in->width / 2)
-                            inv_cache[output_idx] = (srci*in->linesize[0]) + (eye*in->width / 2 + srcj)*NUM_CHANNELS + channel;
-                    }
-                }
-            }
-        }
-    }
-
     {
         uint8_t *dst = out->data[0];
-        int *inv_cache_p = inv_cache;
+        int *inv_cache_p = unwarpvr->inv_cache;
         int jlimit = outlink->w * NUM_CHANNELS;
         int end_of_line_size = out->linesize[0] - jlimit;
         for (i = 0; i < outlink->h; i++) {
             for (j = 0; j < jlimit; j++, inv_cache_p++, dst++) {
-                *dst = src[*inv_cache_p];
+                *dst = (*inv_cache_p == -1) ? 0 : src[*inv_cache_p];
             }
             dst += end_of_line_size;
         }
@@ -730,11 +956,18 @@ static const AVOption unwarpvr_options[] = {
     { "disable",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 0 }, 0, 0, FLAGS, "force_oar" },
     { "decrease", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 1 }, 0, 0, FLAGS, "force_oar" },
     { "increase", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 2 }, 0, 0, FLAGS, "force_oar" },
-    { "swap_eyes", "swap the two eye views", OFFSET(swap_eyes), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
+    { "swap_eyes", "swap the two eye views in the input before processing", OFFSET(swap_eyes), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
     { "left_eye_only", "render only the left eye view", OFFSET(left_eye_only), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
     { "scale_width", "scales width of output (1.0 for none)", OFFSET(scale_width), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
     { "scale_height", "scales height of output (1.0 for none)", OFFSET(scale_height), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
+    { "scale_in_width", "sets scales of input (1.0 for none)", OFFSET(scale_in_width), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
+    { "scale_in_height", "sets scales of input (1.0 for none)", OFFSET(scale_in_height), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, -INFINITY, INFINITY, FLAGS },
     { "eye_relief_dial", "setting of eye relief dial at time of recording (0-10, 10 is farthest out)", OFFSET(eye_relief_dial), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 10, FLAGS },
+    { "forward_warp", "warps an undistorted image to suit a VR device, instead of unwarping", OFFSET(forward_warp), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
+    { "ppd", "sets PPD (pixels per degree) of input in forward warp mode (by default same as output)", OFFSET(ppd), AV_OPT_TYPE_FLOAT, { .dbl = 0.0 }, -INFINITY, INFINITY, FLAGS },
+    { "device", "indicates which HMD device was used to record the video", OFFSET(device), AV_OPT_TYPE_STRING, { .str = "RiftDK2" }, .flags = FLAGS },
+    { "sdkversion", "indicates what version of the HMD device's SDK was used to record the video", OFFSET(sdkversion), AV_OPT_TYPE_STRING, { .str = "default" }, .flags = FLAGS },
+    { "mono_input", "indicates that the input provides only one eye view which should be used for both eyes", OFFSET(mono_input), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS },
     { NULL }
 };
 
