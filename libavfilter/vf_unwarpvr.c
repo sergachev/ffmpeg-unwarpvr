@@ -50,7 +50,8 @@
 #include <windows.h>
 const char *unexpanded_profile_path = "%USERPROFILE%\\AppData\\Local\\Oculus\\ProfileDB.json";
 #else
-const char *unexpanded_profile_path = NULL;
+#include <wordexp.h>
+const char *unexpanded_profile_path = "~/Library/Preferences/Oculus/ProfileDB.json";
 #endif
 
 static const char *const var_names[] = {
@@ -160,7 +161,9 @@ static av_cold int read_ovr_profile(AVFilterContext *ctx)
     char profile_path[FILENAME_MAX + 1];
     ExpandEnvironmentStrings(unexpanded_profile_path, profile_path, sizeof(profile_path) / sizeof(*profile_path));
 #else
-    char* profile_path = ""; // No Oculus SDK for Linux for DK2 yet. TODO: Make this work for DK1 at least.
+    wordexp_t exp_result;
+    wordexp(unexpanded_profile_path, &exp_result, 0);
+    char* profile_path = exp_result.we_wordv[0]; //""; // No Oculus SDK for Linux for DK2 yet. TODO: Make this work for DK1 at least.
 #endif
 
     // Default settings if not specified in JSON
