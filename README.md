@@ -1,3 +1,18 @@
+This is a fork of excellent eVRydayVR/ffmpeg-unwarpvr, which can not only unwarp, but do a direct warp too!.
+
+Current changes:
+* merged most recent ffmpeg master
+* fixed oculus sdk profile path for MacOSX
+
+The idea is to use this project together with https://github.com/pierrezurek/Samples/tree/master/Unix/BebopDroneReceiveStream
+for FPV flights with oculus rift + parrot bebop drone.
+
+./ffmpeg -i /tmp/dronefifo -vf unwarpvr=1920:1080:forward_warp=1:ppd=15:mono_input=1 -f avi pipe:|mplayer -
+
+Work in progress, but almost done.
+
+
+
 FFmpeg README
 =============
 
