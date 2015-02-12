@@ -275,6 +275,9 @@ External library support:
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
 
+  --enable-libjansson      enable JSON parsing via Jansson [yes]
+
+
 Toolchain options:
   --arch=ARCH              select architecture [$arch]
   --cpu=CPU                select the minimum required CPU (affects
@@ -1412,6 +1415,7 @@ EXTERNAL_LIBRARY_LIST="
     x11grab
     xlib
     zlib
+    libjansson
 "
 
 DOCUMENT_LIST="
@@ -2635,6 +2639,7 @@ tinterlace_pad_test_deps="tinterlace_filter"
 uspp_filter_deps="gpl avcodec"
 zmq_filter_deps="libzmq"
 zoompan_filter_deps="swscale"
+unwarpvr_filter_deps="libjansson"
 
 # examples
 avio_reading="avformat avcodec avutil"
@@ -4944,6 +4949,7 @@ enabled libvpx            && {
     enabled libvpx_vp9_encoder && { check_lib2 "vpx/vpx_encoder.h vpx/vp8cx.h" "vpx_codec_vp9_cx VP9E_SET_AQ_MODE" -lvpx || disable libvpx_vp9_encoder; } }
 enabled libwavpack        && require libwavpack wavpack/wavpack.h WavpackOpenFileOutput  -lwavpack
 enabled libwebp           && require_pkg_config "libwebp >= 0.2.0" webp/encode.h WebPGetEncoderVersion
+enabled libjansson        && require libjansson jansson.h json_loads -ljansson
 enabled libx264           && { use_pkg_config x264 "stdint.h x264.h" x264_encoder_encode ||
                                { require libx264 x264.h x264_encoder_encode -lx264 &&
                                  warn "using libx264 without pkg-config"; } } &&
