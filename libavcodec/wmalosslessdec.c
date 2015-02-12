@@ -147,8 +147,8 @@ typedef struct WmallDecodeCtx {
         int coefsend;
         int bitsend;
         DECLARE_ALIGNED(16, int16_t, coefs)[MAX_ORDER + WMALL_COEFF_PAD_SIZE/sizeof(int16_t)];
-        DECLARE_ALIGNED(16, int16_t, lms_prevvalues)[MAX_ORDER * 2];
-        DECLARE_ALIGNED(16, int16_t, lms_updates)[MAX_ORDER * 2];
+        DECLARE_ALIGNED(16, int16_t, lms_prevvalues)[MAX_ORDER * 2 + WMALL_COEFF_PAD_SIZE/sizeof(int16_t)];
+        DECLARE_ALIGNED(16, int16_t, lms_updates)[MAX_ORDER * 2 + WMALL_COEFF_PAD_SIZE/sizeof(int16_t)];
         int recent;
     } cdlms[WMALL_MAX_CHANNELS][9];
 
@@ -200,8 +200,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
             avctx->sample_fmt = AV_SAMPLE_FMT_S16P;
         else if (s->bits_per_sample == 24) {
             avctx->sample_fmt = AV_SAMPLE_FMT_S32P;
-            avpriv_report_missing_feature(avctx, "Bit-depth higher than 16");
-            return AVERROR_PATCHWELCOME;
+            avctx->bits_per_raw_sample = 24;
         } else {
             av_log(avctx, AV_LOG_ERROR, "Unknown bit-depth: %"PRIu8"\n",
                    s->bits_per_sample);
@@ -712,17 +711,16 @@ static void lms_update(WmallDecodeCtx *s, int ich, int ilms, int input)
 {
     int recent = s->cdlms[ich][ilms].recent;
     int range  = 1 << s->bits_per_sample - 1;
+    int order  = s->cdlms[ich][ilms].order;
 
     if (recent)
         recent--;
     else {
-        memcpy(&s->cdlms[ich][ilms].lms_prevvalues[s->cdlms[ich][ilms].order],
-               s->cdlms[ich][ilms].lms_prevvalues,
-               2 * s->cdlms[ich][ilms].order);
-        memcpy(&s->cdlms[ich][ilms].lms_updates[s->cdlms[ich][ilms].order],
-               s->cdlms[ich][ilms].lms_updates,
-               2 * s->cdlms[ich][ilms].order);
-        recent = s->cdlms[ich][ilms].order - 1;
+        memcpy(s->cdlms[ich][ilms].lms_prevvalues + order,
+               s->cdlms[ich][ilms].lms_prevvalues, 2 * order);
+        memcpy(s->cdlms[ich][ilms].lms_updates + order,
+               s->cdlms[ich][ilms].lms_updates, 2 * order);
+        recent = order - 1;
     }
 
     s->cdlms[ich][ilms].lms_prevvalues[recent] = av_clip(input, -range, range - 1);
@@ -733,9 +731,11 @@ static void lms_update(WmallDecodeCtx *s, int ich, int ilms, int input)
     else
         s->cdlms[ich][ilms].lms_updates[recent] = s->update_speed[ich];
 
-    s->cdlms[ich][ilms].lms_updates[recent + (s->cdlms[ich][ilms].order >> 4)] >>= 2;
-    s->cdlms[ich][ilms].lms_updates[recent + (s->cdlms[ich][ilms].order >> 3)] >>= 1;
+    s->cdlms[ich][ilms].lms_updates[recent + (order >> 4)] >>= 2;
+    s->cdlms[ich][ilms].lms_updates[recent + (order >> 3)] >>= 1;
     s->cdlms[ich][ilms].recent = recent;
+    memset(s->cdlms[ich][ilms].lms_updates + recent + order, 0,
+           sizeof(s->cdlms[ich][ilms].lms_updates) - 2*(recent+order));
 }
 
 static void use_high_update_speed(WmallDecodeCtx *s, int ich)
@@ -791,7 +791,8 @@ static void revert_cdlms(WmallDecodeCtx *s, int ch,
                                                             + s->cdlms[ch][ilms].recent,
                                                         s->cdlms[ch][ilms].lms_updates
                                                             + s->cdlms[ch][ilms].recent,
-                                                        s->cdlms[ch][ilms].order,
+                                                        FFALIGN(s->cdlms[ch][ilms].order,
+                                                                WMALL_COEFF_PAD_SIZE),
                                                         WMASIGN(residue));
             input = residue + (pred >> s->cdlms[ch][ilms].scaling);
             lms_update(s, ch, ilms, input);
@@ -997,7 +998,7 @@ static int decode_subframe(WmallDecodeCtx *s)
             if (s->bits_per_sample == 16) {
                 *s->samples_16[c]++ = (int16_t) s->channel_residues[c][j] << padding_zeroes;
             } else {
-                *s->samples_32[c]++ = s->channel_residues[c][j] << padding_zeroes;
+                *s->samples_32[c]++ = s->channel_residues[c][j] << (padding_zeroes + 8);
             }
         }
     }

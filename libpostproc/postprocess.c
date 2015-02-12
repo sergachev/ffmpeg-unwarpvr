@@ -89,6 +89,9 @@ try to unroll inner for(x=0 ... loop to avoid these damn if(x ... checks
 #include "postprocess_internal.h"
 #include "libavutil/avstring.h"
 
+#include "libavutil/ffversion.h"
+const char postproc_ffversion[] = "FFmpeg version " FFMPEG_VERSION;
+
 unsigned postproc_version(void)
 {
     av_assert0(LIBPOSTPROC_VERSION_MICRO >= 100);
@@ -994,7 +997,7 @@ void  pp_postprocess(const uint8_t * src[3], const int srcStride[3],
 
     if(pict_type & PP_PICT_TYPE_QP2){
         int i;
-        const int count= mbHeight * absQPStride;
+        const int count= FFMAX(mbHeight * absQPStride, mbWidth);
         for(i=0; i<(count>>2); i++){
             ((uint32_t*)c->stdQPTable)[i] = (((const uint32_t*)QP_store)[i]>>1) & 0x7F7F7F7F;
         }
@@ -1019,7 +1022,7 @@ void  pp_postprocess(const uint8_t * src[3], const int srcStride[3],
     if((pict_type&7)!=3){
         if (QPStride >= 0){
             int i;
-            const int count= mbHeight * QPStride;
+            const int count= FFMAX(mbHeight * QPStride, mbWidth);
             for(i=0; i<(count>>2); i++){
                 ((uint32_t*)c->nonBQPTable)[i] = ((const uint32_t*)QP_store)[i] & 0x3F3F3F3F;
             }
@@ -1041,6 +1044,9 @@ void  pp_postprocess(const uint8_t * src[3], const int srcStride[3],
 
     postProcess(src[0], srcStride[0], dst[0], dstStride[0],
                 width, height, QP_store, QPStride, 0, mode, c);
+
+    if (!(src[1] && src[2] && dst[1] && dst[2]))
+        return;
 
     width  = (width )>>c->hChromaSubSample;
     height = (height)>>c->vChromaSubSample;

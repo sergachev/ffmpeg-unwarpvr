@@ -22,6 +22,8 @@
 #ifndef AVCODEC_SNOW_H
 #define AVCODEC_SNOW_H
 
+#include "libavutil/motion_vector.h"
+
 #include "hpeldsp.h"
 #include "me_cmp.h"
 #include "qpeldsp.h"
@@ -29,6 +31,8 @@
 
 #include "rangecoder.h"
 #include "mathops.h"
+
+#define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(SnowContext, m))
 #include "mpegvideo.h"
 #include "h264qpel.h"
 
@@ -176,6 +180,9 @@ typedef struct SnowContext{
 
     uint8_t *scratchbuf;
     uint8_t *emu_edge_buffer;
+
+    AVMotionVector *avmv;
+    int avmv_index;
 }SnowContext;
 
 /* Tables */

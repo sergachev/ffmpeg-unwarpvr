@@ -57,6 +57,16 @@ typedef struct MpegTSService {
     int pcr_packet_period;
 } MpegTSService;
 
+// service_type values as defined in ETSI 300 468
+enum {
+    MPEGTS_SERVICE_TYPE_DIGITAL_TV                   = 0x01,
+    MPEGTS_SERVICE_TYPE_DIGITAL_RADIO                = 0x02,
+    MPEGTS_SERVICE_TYPE_TELETEXT                     = 0x03,
+    MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_RADIO = 0x0A,
+    MPEGTS_SERVICE_TYPE_MPEG2_DIGITAL_HDTV           = 0x11,
+    MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_SDTV  = 0x16,
+    MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_HDTV  = 0x19
+};
 typedef struct MpegTSWrite {
     const AVClass *av_class;
     MpegTSSection pat; /* MPEG2 pat table */
@@ -76,6 +86,7 @@ typedef struct MpegTSWrite {
     int transport_stream_id;
     int original_network_id;
     int service_id;
+    int service_type;
 
     int pmt_start_pid;
     int start_pid;
@@ -521,7 +532,7 @@ static void mpegts_write_sdt(AVFormatContext *s)
         *q++         = 0x48;
         desc_len_ptr = q;
         q++;
-        *q++         = 0x01; /* digital television service */
+        *q++         = ts->service_type;
         putstr8(&q, service->provider_name);
         putstr8(&q, service->name);
         desc_len_ptr[0] = q - desc_len_ptr - 1;
@@ -577,7 +588,7 @@ static void mpegts_prefix_m2ts_header(AVFormatContext *s)
         uint32_t tp_extra_header = pcr % 0x3fffffff;
         tp_extra_header = AV_RB32(&tp_extra_header);
         avio_write(s->pb, (unsigned char *) &tp_extra_header,
-                sizeof(tp_extra_header));
+                   sizeof(tp_extra_header));
     }
 }
 
@@ -721,6 +732,7 @@ static int mpegts_write_header(AVFormatContext *s)
             ret = avcodec_copy_context(ast->codec, st->codec);
             if (ret != 0)
                 goto fail;
+            ast->time_base = st->time_base;
             ret = avformat_write_header(ts_st->amux, NULL);
             if (ret < 0)
                 goto fail;
@@ -813,9 +825,9 @@ fail:
         service = ts->services[i];
         av_freep(&service->provider_name);
         av_freep(&service->name);
-        av_free(service);
+        av_freep(&service);
     }
-    av_free(ts->services);
+    av_freep(&ts->services);
     return ret;
 }
 
@@ -1399,7 +1411,8 @@ static int mpegts_write_end(AVFormatContext *s)
     MpegTSService *service;
     int i;
 
-    mpegts_write_flush(s);
+    if (s->pb)
+        mpegts_write_flush(s);
 
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
@@ -1415,9 +1428,9 @@ static int mpegts_write_end(AVFormatContext *s)
         service = ts->services[i];
         av_freep(&service->provider_name);
         av_freep(&service->name);
-        av_free(service);
+        av_freep(&service);
     }
-    av_free(ts->services);
+    av_freep(&ts->services);
 
     return 0;
 }
@@ -1432,12 +1445,36 @@ static const AVOption options[] = {
     { "mpegts_service_id", "Set service_id field.",
       offsetof(MpegTSWrite, service_id), AV_OPT_TYPE_INT,
       { .i64 = 0x0001 }, 0x0001, 0xffff, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mpegts_service_type", "Set service_type field.",
+      offsetof(MpegTSWrite, service_type), AV_OPT_TYPE_INT,
+      { .i64 = 0x01 }, 0x01, 0xff, AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "digital_tv", "Digital Television.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_DIGITAL_TV }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "digital_radio", "Digital Radio.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_DIGITAL_RADIO }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "teletext", "Teletext.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_TELETEXT }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "advanced_codec_digital_radio", "Advanced Codec Digital Radio.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_RADIO }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "mpeg2_digital_hdtv", "MPEG2 Digital HDTV.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_MPEG2_DIGITAL_HDTV }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "advanced_codec_digital_sdtv", "Advanced Codec Digital SDTV.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_SDTV }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
+    { "advanced_codec_digital_hdtv", "Advanced Codec Digital HDTV.",
+      0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_SERVICE_TYPE_ADVANCED_CODEC_DIGITAL_HDTV }, 0x01, 0xff,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_service_type" },
     { "mpegts_pmt_start_pid", "Set the first pid of the PMT.",
       offsetof(MpegTSWrite, pmt_start_pid), AV_OPT_TYPE_INT,
       { .i64 = 0x1000 }, 0x0010, 0x1f00, AV_OPT_FLAG_ENCODING_PARAM },
     { "mpegts_start_pid", "Set the first pid.",
       offsetof(MpegTSWrite, start_pid), AV_OPT_TYPE_INT,
-      { .i64 = 0x0100 }, 0x0100, 0x0f00, AV_OPT_FLAG_ENCODING_PARAM },
+      { .i64 = 0x0100 }, 0x0020, 0x0f00, AV_OPT_FLAG_ENCODING_PARAM },
     { "mpegts_m2ts_mode", "Enable m2ts mode.",
       offsetof(MpegTSWrite, m2ts_mode), AV_OPT_TYPE_INT,
       { .i64 = -1 }, -1, 1, AV_OPT_FLAG_ENCODING_PARAM },

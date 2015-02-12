@@ -65,7 +65,7 @@ static int dxtory_decode_v1_410(AVCodecContext *avctx, AVFrame *pic,
     uint8_t *Y1, *Y2, *Y3, *Y4, *U, *V;
     int ret;
 
-    if (src_size < avctx->width * avctx->height * 9L / 8) {
+    if (src_size < avctx->width * avctx->height * 9LL / 8) {
         av_log(avctx, AV_LOG_ERROR, "packet too small\n");
         return AVERROR_INVALIDDATA;
     }
@@ -82,10 +82,10 @@ static int dxtory_decode_v1_410(AVCodecContext *avctx, AVFrame *pic,
     V  = pic->data[2];
     for (h = 0; h < avctx->height; h += 4) {
         for (w = 0; w < avctx->width; w += 4) {
-            AV_COPY32(Y1 + w, src);
-            AV_COPY32(Y2 + w, src + 4);
-            AV_COPY32(Y3 + w, src + 8);
-            AV_COPY32(Y4 + w, src + 12);
+            AV_COPY32U(Y1 + w, src);
+            AV_COPY32U(Y2 + w, src + 4);
+            AV_COPY32U(Y3 + w, src + 8);
+            AV_COPY32U(Y4 + w, src + 12);
             U[w >> 2] = src[16] + 0x80;
             V[w >> 2] = src[17] + 0x80;
             src += 18;
@@ -108,7 +108,7 @@ static int dxtory_decode_v1_420(AVCodecContext *avctx, AVFrame *pic,
     uint8_t *Y1, *Y2, *U, *V;
     int ret;
 
-    if (src_size < avctx->width * avctx->height * 3L / 2) {
+    if (src_size < avctx->width * avctx->height * 3LL / 2) {
         av_log(avctx, AV_LOG_ERROR, "packet too small\n");
         return AVERROR_INVALIDDATA;
     }
@@ -145,7 +145,7 @@ static int dxtory_decode_v1_444(AVCodecContext *avctx, AVFrame *pic,
     uint8_t *Y, *U, *V;
     int ret;
 
-    if (src_size < avctx->width * avctx->height * 3L) {
+    if (src_size < avctx->width * avctx->height * 3LL) {
         av_log(avctx, AV_LOG_ERROR, "packet too small\n");
         return AVERROR_INVALIDDATA;
     }
